@@ -205,7 +205,8 @@ def main():
         worst_up = min(worst_up, up.dot((mw.to_3x3() @ s[2]).normalized()))
         along = fwd.dot((mw.to_3x3() @ s[1]).normalized())
         worst_fwd = min(worst_fwd, abs(along))
-        lane_dir = 1.0 if o.constraints[0].target.get("cf_lane", "").startswith("R") else -1.0
+        first_lane = o.constraints[0].target["cf_route"].split("\n")[0].split("\t")[1]
+        lane_dir = 1.0 if first_lane.startswith("R") else -1.0
         if along * lane_dir < 0:
             wrong_way += 1
     scene.frame_set(1 + int(fps * 2))
@@ -245,11 +246,161 @@ def main():
         scene.frame_set(1)
         render_preview(road, os.path.join(render_dir, "traffic.png"))
     bpy.ops.civil.traffic_remove()
-    left = [o for o in bpy.data.objects if o.get("cf_kind") or o.get("cf_lane")]
+    left = [o for o in bpy.data.objects if o.get("cf_kind") or o.get("cf_route")]
     ok = not left and road.civil_props.traffic_collection is None
     print(f"[{'OK ' if ok else 'BAD'}] TRAFFIC REMOVE {len(left)} leftovers")
     if not ok:
         failures.append("TRAFFIC REMOVE")
+
+    def max_step(cars, frames):
+        """Largest distance any vehicle moves between consecutive frames, relative to its speed."""
+        worst = 0.0
+        prev = None
+        for fr in frames:
+            scene.frame_set(fr)
+            cur = {o.name: o.matrix_world.translation.copy() for o in cars}
+            if prev:
+                for o in cars:
+                    worst = max(worst, (cur[o.name] - prev[o.name]).length / (o["cf_speed"] / fps))
+            prev = cur
+        return worst
+
+    # Linked roads: a highway continued by an overpass, then a street; traffic flows across all three
+    clear_scene()
+    bpy.context.scene.cursor.location = (0, 0, 0)
+    bpy.ops.civil.create_road_preset(preset_type='HIGHWAY', length=120.0)
+    hw = bpy.context.active_object
+    bpy.ops.civil.road_continue(preset_type='OVERPASS', length=150.0, bend=45.0, rise=6.0)
+    ov = bpy.context.active_object
+    bpy.ops.civil.road_continue(preset_type='STREET', length=80.0, match_lanes=False)
+    st = bpy.context.active_object
+    bpy.context.view_layer.objects.active = hw
+    hw.select_set(True)
+    res = bpy.ops.civil.traffic_generate()
+    col = hw.civil_props.traffic_collection
+    routes = [o for o in col.all_objects if o.get("cf_route")]
+    spans = [len({ln.split("\t")[0] for ln in r["cf_route"].split("\n")}) for r in routes]
+    shared = all(r.civil_props.traffic_collection == col for r in (hw, ov, st))
+    cars = [o for o in col.objects if o.get("cf_kind")]
+    ov_start = mod.road_end_frame(ov, at_end=False)[0]
+    hw_end = mod.road_end_frame(hw, at_end=True)[0]
+    # Within a route, the only jump allowed is the wrap from its end back to its start.
+    jumps = 0
+    for o in cars:
+        L = o.constraints[0].target["cf_length"]
+        prev = None
+        for fr in range(1, 1 + int(fps * 4)):
+            scene.frame_set(fr)
+            cur = o.matrix_world.translation.copy()
+            if prev is not None and (cur - prev).length > 3 * o["cf_speed"] / fps:
+                jumps += 1
+            prev = cur
+    wraps_allowed = sum(1 for o in cars if o["cf_speed"] * 4 > 0)  # at most one wrap each in 4 s
+    ok = (res == {'FINISHED'} and shared and (hw_end - ov_start).length < 0.01 and max(spans) == 3
+          and len(cars) > 10 and jumps <= wraps_allowed)
+    print(f"[{'OK ' if ok else 'BAD'}] LINKED ROADS  {len(routes)} routes, longest crosses {max(spans)} roads, "
+          f"{len(cars)} vehicles, shared={shared}, join gap={(hw_end - ov_start).length:.3f} m, jumps={jumps}")
+    if not ok:
+        failures.append("LINKED ROADS")
+    # Editing the middle road re-lays routes that cross it
+    route = max(routes, key=lambda r: len(r["cf_route"]))
+    ov.civil_props.segments[0].bend = -30.0
+    bpy.context.view_layer.update()
+    sp = route.data.splines[0]
+    near = min((Vector(pt.co[:3]) - mod.road_end_frame(ov, at_end=True)[0]).length for pt in sp.points)
+    gap = (mod.road_end_frame(ov, True)[0] - mod.road_end_frame(st, False)[0]).length
+    ok = near < ov.civil_props.lanes_right * ov.civil_props.lane_width + 6 and gap < 0.01
+    print(f"[{'OK ' if ok else 'BAD'}] LINKED EDIT   street stayed on the reshaped overpass (gap {gap:.3f} m); "
+          f"route passes {near:.1f} m from the join")
+    if not ok:
+        failures.append("LINKED EDIT")
+    if render_dir:
+        ov.civil_props.segments[0].bend = 45.0
+        scene.frame_set(30)
+        render_preview(ov, os.path.join(render_dir, "linked.png"))
+
+    # A road closed into a loop: traffic circulates with no jumps at all
+    clear_scene()
+    bpy.ops.civil.create_road_preset(preset_type='STREET', length=60.0, bend=90.0)
+    loop = bpy.context.active_object
+    for _ in range(3):
+        bpy.ops.civil.segment_add(kind='LEFT', length=60.0, bend=90.0)
+    loop.civil_props.traffic_density = 4.0
+    bpy.ops.civil.traffic_generate()
+    col = loop.civil_props.traffic_collection
+    routes = [o for o in col.all_objects if o.get("cf_route")]
+    cars = [o for o in col.objects if o.get("cf_kind")]
+    worst = max_step(cars, range(1, 1 + int(fps * 12)))
+    cyclic = all(r["cf_cyclic"] for r in routes)
+    ok = cyclic and len(routes) == 2 and worst < 1.2 and len(cars) >= 4
+    print(f"[{'OK ' if ok else 'BAD'}] LOOP          {len(routes)} closed routes={cyclic}, {len(cars)} vehicles, "
+          f"worst frame step {worst:.2f}x expected over 12 s")
+    if not ok:
+        failures.append("LOOP")
+
+    # Join Roads snaps the active road's start onto the other road's end
+    clear_scene()
+    bpy.ops.civil.create_road_preset(preset_type='STREET', length=50.0, bend=30.0)
+    a = bpy.context.active_object
+    bpy.context.scene.cursor.location = (30, -80, 5)
+    bpy.ops.civil.create_road_preset(preset_type='STREET', length=50.0)
+    b = bpy.context.active_object
+    b.civil_props.target_curve.rotation_euler = (0, 0, 2.0)
+    bpy.context.view_layer.update()
+    a.select_set(True)
+    b.select_set(True)
+    bpy.context.view_layer.objects.active = b
+    res = bpy.ops.civil.road_snap()
+    bpy.context.view_layer.update()
+    (pa, ha), (pb, hb) = mod.road_end_frame(a, True), mod.road_end_frame(b, False)
+    ok = res == {'FINISHED'} and (pa - pb).length < 0.01 and abs(math.remainder(ha - hb, math.tau)) < 0.01
+    print(f"[{'OK ' if ok else 'BAD'}] JOIN ROADS    gap {(pa - pb).length:.4f} m, "
+          f"heading diff {math.degrees(abs(math.remainder(ha - hb, math.tau))):.3f} deg")
+    if not ok:
+        failures.append("JOIN ROADS")
+    bpy.context.scene.cursor.location = (0, 0, 0)
+
+    # Banked road: lamp heads, sign cabinets and walls stand level/vertical; both gantry styles carry text
+    clear_scene()
+    bpy.ops.civil.create_road_preset(preset_type='HIGHWAY', length=160.0, bend=70.0)
+    road = bpy.context.active_object
+    p = road.civil_props
+    p.is_civil_object = False
+    p.superelevation_factor = 5.0
+    p.max_bank_angle = 12.0
+    p.add_toll_plaza = False
+    p.streetlight_placement = 'BOTH'
+    p.add_sound_walls = True
+    p.add_gantry_signs = True
+    p.gantry_spacing = 50.0
+    p.is_civil_object = True
+    for style in ('FULL_SPAN', 'CANTILEVER'):
+        p.gantry_style = style
+        p.gantry_sign_type = 'ALTERNATE'
+        me = road.data
+        samples = mod.road_local_samples(road)
+        bank = max(math.degrees(math.asin(min(1.0, abs(r.z)))) for _, _, _, r in samples)
+
+        def tilt_of(mat):
+            worst = 0.0
+            for f in me.polygons:
+                if f.material_index == mat:
+                    nz = abs(f.normal.z)
+                    worst = max(worst, min(math.degrees(math.acos(min(1.0, nz))), math.degrees(math.asin(min(1.0, nz)))))
+            return worst
+        lamp_tilt = tilt_of(7)     # luminaires
+        cabinet_tilt = tilt_of(11)  # LED sign cabinets
+        # Sound wall sides must be vertical (their base follows the banked road, so skip flat-ish faces).
+        wall_tilt = max((math.degrees(math.asin(min(1.0, abs(f.normal.z)))) for f in me.polygons
+                         if f.material_index == 3 and abs(f.normal.z) < 0.5), default=0.0)
+        led_text = sum(1 for f in me.polygons if f.material_index == 10)
+        guide_faces = sum(1 for f in me.polygons if f.material_index == 8)
+        ok = (bank > 5.0 and lamp_tilt < 0.5 and cabinet_tilt < 0.5 and wall_tilt < 0.5
+              and led_text > 200 and guide_faces >= 1)
+        print(f"[{'OK ' if ok else 'BAD'}] UPRIGHT {style:10s} road banks {bank:.1f} deg; lamps tilt {lamp_tilt:.2f}, "
+              f"LED cabinets {cabinet_tilt:.2f}, walls {wall_tilt:.2f} deg; LED text faces {led_text}, guide faces {guide_faces}")
+        if not ok:
+            failures.append(f"UPRIGHT {style}")
 
     # Spline tilt lands where the control point really is along the curve
     clear_scene()

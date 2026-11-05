@@ -1,14 +1,15 @@
 """
 CivilFlow traffic: low-poly cars and trucks driving along a road's lanes.
 
-Each lane gets a hidden path curve (parented to the road) that runs in that lane's direction of
-travel and carries the road's banking as tilt. Each vehicle follows its lane with a Follow Path
-constraint whose offset is driven by a simple driver expression (no Python auto-run needed):
+Lanes whose ends meet (on the same road or across roads) are linked into routes, and each route
+gets a hidden path curve that runs in its direction of travel and carries the roads' banking as
+tilt. A route that closes on itself is a seamless loop. Each vehicle follows a route with a Follow
+Path constraint whose offset is driven by a simple driver expression (no Python auto-run needed):
 
     offset = fract(phase + frame * speed / (fps * lane_length))
 
 Speed and phase are custom properties on each vehicle, so they can be tweaked per vehicle.
-Lane paths are rewritten whenever the road rebuilds, so traffic follows road edits live.
+Routes are rewritten whenever a road they run over rebuilds, so traffic follows road edits live.
 """
 
 import math
@@ -217,20 +218,24 @@ def vehicle_mesh(kind):
 
 
 # ==============================================================================
-# Lanes
+# Lanes and links between roads
 # ==============================================================================
 
-LANE_Z = 0.08  # asphalt top above the guide curve
+LANE_Z = 0.08    # asphalt top above the guide curve
+LINK_GAP = 4.0   # how far apart (along the road) a lane's end and the next lane's start may be
+LINK_SIDE = 1.6  # how far sideways, in lane widths, so lanes can merge into or split from each other
 
 
-def lane_layout(props):
+def lane_layout(props, left_hand=None):
     """[(key, x offset, direction, rank)]; direction +1 travels along the curve, rank 0 is the kerb lane."""
+    if left_hand is None:
+        left_hand = props.traffic_left_hand
     med = props.median_width if (props.lanes_left > 0 and props.lanes_right > 0) else 0.0
     half_w = ((props.lanes_left + props.lanes_right) * props.lane_width + med + props.shoulder_width * 2.0) * 0.5
     right_edge = half_w - props.shoulder_width
     left_edge = -half_w + props.shoulder_width
     # Right-hand traffic travels along the curve on its right side; left-hand traffic on its left.
-    fwd = -1.0 if props.traffic_left_hand else 1.0
+    fwd = -1.0 if left_hand else 1.0
     lanes = []
     for k in range(props.lanes_right):
         lanes.append((f"R{k}", right_edge - (k + 0.5) * props.lane_width, fwd, k))
@@ -258,33 +263,217 @@ def lane_points(samples, x, direction):
     return pts
 
 
-def write_lane_curve(lane_obj, pts):
-    cu = lane_obj.data
+def _polyline_length(pts):
+    return sum((pts[i][0] - pts[i - 1][0]).length for i in range(1, len(pts)))
+
+
+def is_traffic_road(o):
+    return (o.type == 'MESH' and o.civil_props.is_civil_object and o.civil_props.target_curve is not None
+            and (o.civil_props.lanes_left + o.civil_props.lanes_right) > 0)
+
+
+def road_lanes(road, left_hand, local_samples=None, depsgraph=None):
+    """The road's lanes in world space: [{road, key, rank, n_dir, width, speed, pts}]."""
+    from . import road_local_samples
+    if local_samples is None:
+        local_samples = road_local_samples(road, depsgraph)
+    if len(local_samples) < 2:
+        return []
+    mw = road.matrix_world
+    rot = mw.to_3x3()
+    ws = [(mw @ p, (rot @ t).normalized(), (rot @ n).normalized(), (rot @ r).normalized())
+          for p, t, n, r in local_samples]
+    layout = lane_layout(road.civil_props, left_hand)
+    n_dir = {}
+    for _, _, d, _ in layout:
+        n_dir[d] = n_dir.get(d, 0) + 1
+    p = road.civil_props
+    out = []
+    for key, x, d, rank in layout:
+        # Kerb lanes run a little slower than the typical speed, inner lanes a little faster.
+        lane_speed = p.traffic_speed / 3.6 * (0.88 + 0.16 * (rank / max(1, n_dir[d] - 1)))
+        out.append({"road": road, "key": key, "rank": rank, "n_dir": n_dir[d], "width": p.lane_width,
+                    "speed": lane_speed, "pts": lane_points(ws, x, d)})
+    return out
+
+
+def _end_heading(pts, at_end):
+    a, b = (pts[-2][0], pts[-1][0]) if at_end else (pts[0][0], pts[1][0])
+    v = b - a
+    return v.normalized() if v.length > 1e-6 else Vector((1.0, 0.0, 0.0))
+
+
+def link_lanes(lanes):
+    """
+    Pairs each lane's end with the start of the lane that carries on from it, one-to-one,
+    closest pairs first. Lanes link when they point the same way and their ends meet within
+    LINK_GAP along the road and LINK_SIDE lane widths sideways (so a lane can shift over to
+    meet a road with a different number of lanes). A lane may link to its own start, which
+    is how a road closed into a loop gets seamless traffic. Returns {from index: to index}.
+    """
+    cands = []
+    for i, a in enumerate(lanes):
+        end = a["pts"][-1][0]
+        d_a = _end_heading(a["pts"], True)
+        for j, b in enumerate(lanes):
+            if d_a.dot(_end_heading(b["pts"], False)) < 0.9:
+                continue
+            delta = b["pts"][0][0] - end
+            along = delta.dot(d_a)
+            side = (delta - d_a * along).length
+            if abs(along) > LINK_GAP or abs(delta.z) > 1.5:
+                continue
+            if side > LINK_SIDE * max(a["width"], b["width"]):
+                continue
+            cands.append((delta.length, i, j))
+    cands.sort()
+    succ = {}
+    taken = set()
+    for _, i, j in cands:
+        if i in succ or j in taken:
+            continue
+        succ[i] = j
+        taken.add(j)
+    return succ
+
+
+def find_network(scene, start_road, left_hand, depsgraph=None):
+    """All lanes of the roads linked (directly or through others) to start_road, and their links."""
+    roads = [o for o in scene.objects if is_traffic_road(o)]
+    lanes = []
+    for r in roads:
+        lanes.extend(road_lanes(r, left_hand, depsgraph=depsgraph))
+    succ = link_lanes(lanes)
+
+    adj = {}
+    for i, j in succ.items():
+        a, b = lanes[i]["road"].name, lanes[j]["road"].name
+        adj.setdefault(a, set()).add(b)
+        adj.setdefault(b, set()).add(a)
+    comp = {start_road.name}
+    stack = [start_road.name]
+    while stack:
+        for nb in adj.get(stack.pop(), ()):
+            if nb not in comp:
+                comp.add(nb)
+                stack.append(nb)
+
+    keep = [i for i, l in enumerate(lanes) if l["road"].name in comp]
+    remap = {old: new for new, old in enumerate(keep)}
+    net_lanes = [lanes[i] for i in keep]
+    net_succ = {remap[i]: remap[j] for i, j in succ.items() if i in remap and j in remap}
+    net_roads = [r for r in roads if r.name in comp]
+    return net_lanes, net_succ, net_roads
+
+
+def build_chains(n, succ):
+    """Splits the linked lanes into routes: [(lane indices, cyclic)]. Each lane is in exactly one."""
+    has_pred = set(succ.values())
+    visited = set()
+    chains = []
+    for s in range(n):
+        if s in has_pred:
+            continue
+        chain = []
+        cur = s
+        while cur is not None and cur not in visited:
+            visited.add(cur)
+            chain.append(cur)
+            cur = succ.get(cur)
+        chains.append((chain, False))
+    # Whatever is left has a lane before it all the way round: closed loops.
+    for s in range(n):
+        if s in visited:
+            continue
+        chain = []
+        cur = s
+        while cur is not None and cur not in visited:
+            visited.add(cur)
+            chain.append(cur)
+            cur = succ.get(cur)
+        chains.append((chain, cur == s))
+    return chains
+
+
+def _blend_tail(pts, target):
+    """Eases the end of a lane sideways onto the next lane's start, so vehicles drift across smoothly."""
+    delta = target - pts[-1][0]
+    if delta.length < 1e-4:
+        return list(pts)
+    blend = min(max(delta.length * 10.0, 8.0), 40.0, _polyline_length(pts) * 0.5)
+    out = list(pts)
+    out[-1] = (pts[-1][0] + delta, pts[-1][1])
+    dist = 0.0
+    for idx in range(len(pts) - 2, -1, -1):
+        dist += (pts[idx + 1][0] - pts[idx][0]).length
+        if dist >= blend:
+            break
+        u = 1.0 - dist / blend
+        out[idx] = (pts[idx][0] + delta * (u * u * (3.0 - 2.0 * u)), pts[idx][1])
+    return out
+
+
+def route_points(pieces, cyclic):
+    """Joins the lanes of a route into one point list."""
+    out = []
+    n = len(pieces)
+    for k, pts in enumerate(pieces):
+        nxt = pieces[k + 1] if k + 1 < n else (pieces[0] if cyclic else None)
+        if nxt is not None:
+            pts = _blend_tail(pts, nxt[0][0])[:-1]  # its last point is the next lane's first
+        out.extend(pts)
+    return out
+
+
+def write_route_curve(obj, pts, cyclic):
+    cu = obj.data
     cu.splines.clear()
     sp = cu.splines.new('POLY')
     sp.points.add(len(pts) - 1)
-    length = 0.0
     for i, (p, tilt) in enumerate(pts):
         sp.points[i].co = (p.x, p.y, p.z, 1.0)
         sp.points[i].tilt = tilt
-        if i:
-            length += (p - pts[i - 1][0]).length
-    lane_obj["cf_length"] = max(length, 0.01)
+    sp.use_cyclic_u = cyclic
+    length = _polyline_length(pts)
+    if cyclic:
+        length += (pts[0][0] - pts[-1][0]).length
+    obj["cf_length"] = max(length, 0.01)
+    obj["cf_cyclic"] = cyclic
     cu.update_tag()
     return length
 
 
-def update_lane_curves(road, local_samples):
-    """Called after every road rebuild: keeps lane paths on the road as it changes."""
+def update_routes(road, local_samples, depsgraph=None):
+    """Called after every road rebuild: re-lays every route that runs over this road."""
     col = road.civil_props.traffic_collection
     if col is None or len(local_samples) < 2:
         return
-    layout = {key: (x, d) for key, x, d, _ in lane_layout(road.civil_props)}
+    lane_cache = {}
     for o in col.all_objects:
-        key = o.get("cf_lane")
-        if o.type == 'CURVE' and key in layout:
-            x, d = layout[key]
-            write_lane_curve(o, lane_points(local_samples, x, d))
+        spec = o.get("cf_route")
+        if o.type != 'CURVE' or not spec:
+            continue
+        pieces = [line.split("\t") for line in spec.split("\n")]
+        if not any(rn == road.name for rn, _ in pieces):
+            continue
+        left = bool(o.get("cf_left_hand", False))
+        lane_pts = []
+        for rn, key in pieces:
+            if (rn, left) not in lane_cache:
+                r = bpy.data.objects.get(rn)
+                if r is None or not is_traffic_road(r):
+                    lane_cache[(rn, left)] = {}
+                else:
+                    samples = local_samples if r == road else None
+                    lane_cache[(rn, left)] = {l["key"]: l["pts"]
+                                              for l in road_lanes(r, left, samples, depsgraph)}
+            pts = lane_cache[(rn, left)].get(key)
+            if pts:
+                lane_pts.append(pts)
+        if lane_pts:
+            pts = route_points(lane_pts, bool(o.get("cf_cyclic", False)))
+            if len(pts) >= 2:
+                write_route_curve(o, pts, bool(o.get("cf_cyclic", False)))
 
 
 # ==============================================================================
@@ -292,6 +481,7 @@ def update_lane_curves(road, local_samples):
 # ==============================================================================
 
 DRIVER_EXPR = "p + frame * s * b / (f * L) - floor(p + frame * s * b / (f * L))"
+MIN_GAP = 6.0
 
 
 def _add_var(drv, name, id_type, id_ref, path):
@@ -303,7 +493,7 @@ def _add_var(drv, name, id_type, id_ref, path):
     var.targets[0].data_path = path
 
 
-def add_vehicle(scene, collection, kind, lane_obj, phase, speed, color):
+def add_vehicle(scene, collection, kind, route_obj, phase, speed, color):
     obj = bpy.data.objects.new(kind.title().replace('_', ' '), vehicle_mesh(kind))
     collection.objects.link(obj)
     name, rgba = color
@@ -315,7 +505,7 @@ def add_vehicle(scene, collection, kind, lane_obj, phase, speed, color):
     obj["cf_kind"] = kind
 
     con = obj.constraints.new('FOLLOW_PATH')
-    con.target = lane_obj
+    con.target = route_obj
     con.use_curve_follow = True
     con.use_fixed_location = True
     con.forward_axis = 'FORWARD_X'
@@ -325,7 +515,7 @@ def add_vehicle(scene, collection, kind, lane_obj, phase, speed, color):
     drv.type = 'SCRIPTED'
     _add_var(drv, "p", 'OBJECT', obj, '["cf_phase"]')
     _add_var(drv, "s", 'OBJECT', obj, '["cf_speed"]')
-    _add_var(drv, "L", 'OBJECT', lane_obj, '["cf_length"]')
+    _add_var(drv, "L", 'OBJECT', route_obj, '["cf_length"]')
     _add_var(drv, "f", 'SCENE', scene, "render.fps")
     _add_var(drv, "b", 'SCENE', scene, "render.fps_base")
     drv.expression = DRIVER_EXPR
@@ -349,12 +539,17 @@ def _pick_color(rng):
     return PAINT_COLORS[0][0], PAINT_COLORS[0][1]
 
 
+def roads_sharing_traffic(col):
+    return [o for o in bpy.data.objects if o.type == 'MESH' and o.civil_props.traffic_collection == col]
+
+
 def remove_traffic(road):
-    p = road.civil_props
-    col = p.traffic_collection
-    p.traffic_collection = None
+    """Deletes the traffic this road belongs to (shared by every road linked to it)."""
+    col = road.civil_props.traffic_collection
     if col is None:
         return
+    for o in roads_sharing_traffic(col):
+        o.civil_props.traffic_collection = None
     subs = list(col.children_recursive)
     for c in [col] + subs:
         for o in list(c.objects):
@@ -367,73 +562,80 @@ def remove_traffic(road):
     bpy.data.collections.remove(col)
 
 
-def build_traffic(context, road, local_samples):
-    """(Re)creates lane paths and vehicles for `road`. Returns the number of vehicles."""
+def build_traffic(context, road):
+    """
+    (Re)creates traffic for `road` and every road linked to it. Returns (vehicles, roads).
+    Density, truck share, seed and driving side come from `road`; each route's speed is the
+    length-weighted average of the speeds of the roads it runs over.
+    """
     p = road.civil_props
-    remove_traffic(road)
-    lanes = lane_layout(p)
-    if not lanes or len(local_samples) < 2:
-        return 0
-
     scene = context.scene
+    dg = context.evaluated_depsgraph_get()
+    lanes, succ, roads = find_network(scene, road, p.traffic_left_hand, dg)
+    for r in roads:
+        remove_traffic(r)
+    if not lanes:
+        return 0, roads
+
     col = bpy.data.collections.new(f"Traffic_{road.name}")
     scene.collection.children.link(col)
-    lane_col = bpy.data.collections.new(f"Lanes_{road.name}")
-    col.children.link(lane_col)
-    lane_col.hide_render = True
-    p.traffic_collection = col
+    route_col = bpy.data.collections.new(f"Routes_{road.name}")
+    col.children.link(route_col)
+    route_col.hide_render = True
+    for r in roads:
+        r.civil_props.traffic_collection = col
 
     rng = random.Random(p.traffic_seed)
-    base_speed = p.traffic_speed / 3.6
-    min_gap = 6.0
     count = 0
-    lanes_per_dir = {}
-    for _, _, d, _ in lanes:
-        lanes_per_dir[d] = lanes_per_dir.get(d, 0) + 1
-
-    for key, x, d, rank in lanes:
-        cu = bpy.data.curves.new(f"Lane_{road.name}_{key}", type='CURVE')
+    for n_route, (chain, cyclic) in enumerate(build_chains(len(lanes), succ)):
+        pts = route_points([lanes[i]["pts"] for i in chain], cyclic)
+        if len(pts) < 2:
+            continue
+        first = lanes[chain[0]]
+        name = f"Route_{first['road'].name}_{first['key']}"
+        cu = bpy.data.curves.new(name, type='CURVE')
         cu.dimensions = '3D'
         cu.use_path = True
         cu.twist_mode = 'Z_UP'
-        lane_obj = bpy.data.objects.new(f"Lane_{road.name}_{key}", cu)
-        lane_obj["cf_lane"] = key
-        lane_col.objects.link(lane_obj)
-        lane_obj.parent = road
-        lane_obj.hide_render = True
-        lane_obj.display_type = 'WIRE'
-        length = write_lane_curve(lane_obj, lane_points(local_samples, x, d))
+        route_obj = bpy.data.objects.new(name, cu)
+        route_obj["cf_route"] = "\n".join(f"{lanes[i]['road'].name}\t{lanes[i]['key']}" for i in chain)
+        route_obj["cf_left_hand"] = p.traffic_left_hand
+        route_col.objects.link(route_obj)
+        route_obj.hide_render = True
+        route_obj.display_type = 'WIRE'
+        length = write_route_curve(route_obj, pts, cyclic)
 
-        # Kerb lanes run slower and carry most of the trucks; inner lanes are faster.
-        n_dir = lanes_per_dir[d]
-        speed = base_speed * (0.88 + 0.16 * (rank / max(1, n_dir - 1))) * rng.uniform(0.97, 1.03)
-        if n_dir == 1:
+        lane_lens = [_polyline_length(lanes[i]["pts"]) for i in chain]
+        speed = sum(lanes[i]["speed"] * ll for i, ll in zip(chain, lane_lens)) / max(1e-6, sum(lane_lens))
+        speed *= rng.uniform(0.97, 1.03)
+        # Trucks keep mostly to the kerb lane.
+        if first["n_dir"] == 1:
             truck_share = p.traffic_truck_share
-        elif rank == 0:
+        elif first["rank"] == 0:
             truck_share = min(1.0, p.traffic_truck_share * 1.8)
         else:
             truck_share = p.traffic_truck_share * 0.4
 
         # Choose the vehicles first, then share the leftover road between the gaps, so no two
-        # vehicles in a lane ever overlap (they all move at the lane's speed).
+        # vehicles on a route ever overlap (they all move at the route's speed).
         wanted = max(1, round(length * p.traffic_density / 100.0))
         kinds = [_pick_kind(rng, truck_share) for _ in range(wanted)]
-        while kinds and sum(VEHICLE_TYPES[k][1] + min_gap for k in kinds) > length:
+        while kinds and sum(VEHICLE_TYPES[k][1] + MIN_GAP for k in kinds) > length:
             kinds.pop()
         if not kinds:
             continue
-        spare = length - sum(VEHICLE_TYPES[k][1] + min_gap for k in kinds)
+        spare = length - sum(VEHICLE_TYPES[k][1] + MIN_GAP for k in kinds)
         weights = [rng.uniform(0.3, 1.7) for _ in kinds]
         wsum = sum(weights)
         cursor = rng.uniform(0.0, length)
         for k, w in zip(kinds, weights):
             veh_len = VEHICLE_TYPES[k][1]
             centre = cursor + veh_len * 0.5
-            add_vehicle(scene, col, k, lane_obj, (centre / length) % 1.0, speed, _pick_color(rng))
-            cursor += veh_len + min_gap + spare * w / wsum
+            add_vehicle(scene, col, k, route_obj, (centre / length) % 1.0, speed, _pick_color(rng))
+            cursor += veh_len + MIN_GAP + spare * w / wsum
             count += 1
 
-    return count
+    return count, roads
 
 
 # ==============================================================================
@@ -450,32 +652,28 @@ def _active_road(context):
 class CIVIL_OT_TrafficGenerate(bpy.types.Operator):
     bl_idname = "civil.traffic_generate"
     bl_label = "Generate Traffic"
-    bl_description = ("Fill the road's lanes with low-poly cars and trucks that drive along it "
-                      "when you play the animation. Replaces this road's existing traffic")
+    bl_description = ("Fill this road, and every road linked to its ends, with low-poly cars and trucks "
+                      "that drive from road to road when you play the animation. Replaces their existing traffic")
     bl_options = {'REGISTER', 'UNDO'}
 
     @classmethod
     def poll(cls, context):
         road = _active_road(context)
-        return road is not None and (road.civil_props.lanes_left + road.civil_props.lanes_right) > 0
+        return road is not None and is_traffic_road(road)
 
     def execute(self, context):
-        from . import road_local_samples
         road = _active_road(context)
-        samples = road_local_samples(road, context.evaluated_depsgraph_get())
-        if len(samples) < 2:
-            self.report({'WARNING'}, "The road has no usable guide curve.")
-            return {'CANCELLED'}
-        n = build_traffic(context, road, samples)
+        n, roads = build_traffic(context, road)
         context.view_layer.objects.active = road
-        self.report({'INFO'}, f"Added {n} vehicles to {road.name}. Press Space to play.")
+        linked = f" across {len(roads)} linked roads" if len(roads) > 1 else ""
+        self.report({'INFO'}, f"Added {n} vehicles{linked}. Press Space to play.")
         return {'FINISHED'}
 
 
 class CIVIL_OT_TrafficRemove(bpy.types.Operator):
     bl_idname = "civil.traffic_remove"
     bl_label = "Remove Traffic"
-    bl_description = "Delete this road's vehicles and lane paths"
+    bl_description = "Delete the vehicles and routes of this road and the roads linked to it"
     bl_options = {'REGISTER', 'UNDO'}
 
     @classmethod

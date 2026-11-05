@@ -1,7 +1,7 @@
 bl_info = {
     "name": "CivilFlow: Road, Highway & Overpass Generator",
     "author": "AI Assistant",
-    "version": (1, 7, 0),
+    "version": (1, 9, 0),
     "blender": (5, 1, 0),
     "location": "View3D > Sidebar (N) > CivilEng",
     "description": "Procedural roads built from straights and curves, highways, banking, guardrails, gantry signs, tunnels, embankments, cable-stayed towers, toll plazas, and animated low-poly traffic.",
@@ -62,6 +62,9 @@ def ensure_civil_materials(obj):
                                emission_color=(1.0, 0.90, 0.72, 1.0), emission_strength=18.0),   # Slot 7: Streetlight / LED
         get_or_create_material("Civil_Sign_Green", (0.01, 0.24, 0.12, 1.0), roughness=0.35, metallic=0.1), # Slot 8: Sign Face
         get_or_create_material("Civil_Embankment_Dirt", (0.32, 0.25, 0.18, 1.0), roughness=0.95),  # Slot 9: Earth Embankment Slopes
+        get_or_create_material("Civil_LED_Amber", (1.0, 0.55, 0.05, 1.0), roughness=0.3,
+                               emission_color=(1.0, 0.5, 0.02, 1.0), emission_strength=12.0),  # Slot 10: LED message text
+        get_or_create_material("Civil_Sign_Cabinet", (0.025, 0.025, 0.028, 1.0), roughness=0.5),  # Slot 11: LED sign cabinet
     ]
     obj.data.materials.clear()
     for m in mats:
@@ -592,42 +595,194 @@ def add_tunnel_section(bm, samples, left_edges, right_edges, clearance_h, wall_t
     add_extruded_profile(bm, samples, led, mat_index=7, dashed=True, dash_interval=2, x_offsets=cx_list)
 
 
-def add_gantry_sign_at(bm, p, right, tangent, normal, left_x, right_x, clearance_h, sign_h, panels):
-    """Full-span steel truss gantry on two posts carrying green signboards with white borders."""
-    post_l = left_x - 0.7
-    post_r = right_x + 0.7
-    top_h = clearance_h + sign_h + 0.5
+def flat_frame(tangent):
+    """(tangent, right, up) for things that stand upright: the road's heading with banking removed."""
+    up = Vector((0.0, 0.0, 1.0))
+    t = Vector((tangent.x, tangent.y, 0.0))
+    t = t.normalized() if t.length > 1e-6 else Vector((0.0, 1.0, 0.0))
+    return t, t.cross(up).normalized(), up
 
+
+def add_oriented_box(bm, center, ax, ay, az, hx, hy, hz, mat, front_mat=None):
+    """Box centred on `center` with half-sizes along unit axes ax, ay, az; its +az face gets front_mat."""
+    v = [bm.verts.new(center + ax * (sx * hx) + ay * (sy * hy) + az * (sz * hz))
+         for sz in (-1.0, 1.0) for sx, sy in ((-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0))]
+    faces = (((0, 3, 2, 1), mat), ((4, 5, 6, 7), mat if front_mat is None else front_mat),
+             ((0, 1, 5, 4), mat), ((1, 2, 6, 5), mat), ((2, 3, 7, 6), mat), ((3, 0, 4, 7), mat))
+    for idx, m in faces:
+        bm.faces.new([v[i] for i in idx]).material_index = m
+
+
+_TEXT_CACHE = {}
+
+
+def text_shape(text):
+    """Flat lettering for `text` (lines split by newlines), centred on the origin, 1 unit font size.
+    Returns (verts [(x, y)], faces [indices], width, height). Cached per string."""
+    if text in _TEXT_CACHE:
+        return _TEXT_CACHE[text]
+    cu = bpy.data.curves.new("CF_SignText_tmp", 'FONT')
+    cu.body = text
+    cu.align_x = 'CENTER'
+    cu.align_y = 'CENTER'
+    ob = bpy.data.objects.new("CF_SignText_tmp", cu)
+    shape = ([], [], 0.0, 0.0)
+    try:
+        me = bpy.data.meshes.new_from_object(ob)
+        if len(me.vertices):
+            xs = [v.co.x for v in me.vertices]
+            ys = [v.co.y for v in me.vertices]
+            cx, cy = (min(xs) + max(xs)) * 0.5, (min(ys) + max(ys)) * 0.5
+            shape = ([(v.co.x - cx, v.co.y - cy) for v in me.vertices],
+                     [tuple(f.vertices) for f in me.polygons],
+                     max(xs) - min(xs), max(ys) - min(ys))
+        bpy.data.meshes.remove(me)
+    finally:
+        bpy.data.objects.remove(ob)
+        bpy.data.curves.remove(cu)
+    _TEXT_CACHE[text] = shape
+    return shape
+
+
+def add_text(bm, text, center, ax, ay, az, max_w, max_h, mat):
+    """Lettering on a sign face: fitted inside max_w x max_h, facing az. Faces are tagged so the
+    final normal recalculation leaves them facing the reader."""
+    verts, faces, w, h = text_shape(text)
+    if not verts or w <= 0 or h <= 0:
+        return
+    scale = min(max_w / w, max_h / h)
+    bv = [bm.verts.new(center + ax * (x * scale) + ay * (y * scale)) for x, y in verts]
+    for f in faces:
+        try:
+            face = bm.faces.new([bv[i] for i in f])
+        except ValueError:
+            continue
+        face.material_index = mat
+        face.normal_update()
+        if face.normal.dot(az) < 0:
+            face.normal_flip()
+        face.tag = True
+
+
+def sign_message(spec, index):
+    """Pick the index-th message from 'msg one; msg two', with '|' as a line break."""
+    msgs = [m.strip() for m in spec.split(";") if m.strip()]
+    if not msgs:
+        return ""
+    return "\n".join(line.strip() for line in msgs[index % len(msgs)].split("|"))
+
+
+def add_sign_panel(bm, center, look_dir, up, width, height, kind, text):
+    """
+    One sign, centred on `center`, read by drivers travelling along look_dir.
+    GUIDE: green face, white border and white lettering, galvanised back with bracing.
+    LED: deep dark message cabinet with amber LED lettering and amber hazard beacons.
+    """
+    az = -look_dir                      # the face points back at oncoming drivers
+    ax = look_dir.cross(up).normalized()  # drivers' right
+    ay = up
+    hw, hh = width * 0.5, height * 0.5
+    if kind == 'LED':
+        depth = 0.32
+        add_oriented_box(bm, center, ax, ay, az, hw, hh, depth, 11, front_mat=11)
+        face = center + az * (depth + 0.012)
+        add_text(bm, text, face, ax, ay, az, width * 0.84, height * 0.66, 10)
+        for sx in (-1.0, 1.0):
+            add_oriented_box(bm, face + ax * (sx * (hw - 0.22)) + ay * (hh - 0.2), ax, ay, az,
+                             0.11, 0.11, 0.02, 10)
+        return
+    plate = 0.04
+    add_oriented_box(bm, center, ax, ay, az, hw, hh, plate, 6, front_mat=8)
+    face = center + az * (plate + 0.004)
+    bw = 0.06
+    for sy in (-1.0, 1.0):
+        add_oriented_box(bm, face + ay * (sy * (hh - bw)), ax, ay, az, hw - 0.03, bw * 0.5, 0.004, 5)
+    for sx in (-1.0, 1.0):
+        add_oriented_box(bm, face + ax * (sx * (hw - bw)), ax, ay, az, bw * 0.5, hh - 0.03, 0.004, 5)
+    add_text(bm, text, face + az * 0.006, ax, ay, az, width * 0.84, height * 0.7, 5)
+    # Horizontal bracing on the back, so the rear reads as the back of a real sign.
+    for sy in (-0.5, 0.5):
+        add_oriented_box(bm, center - az * (plate + 0.06) + ay * (sy * hh), ax, ay, az,
+                         hw * 0.96, 0.05, 0.05, 6)
+
+
+def add_truss(bm, origin, r_f, t_f, up, x0, x1, z_bot, z_top):
+    """Box truss of four chords between lateral positions x0..x1 (z values are world heights)."""
+    def at(x, z, dt=0.0):
+        q = origin + r_f * x + t_f * dt
+        q.z = z
+        return q
+    cx, hw = (x0 + x1) * 0.5, (x1 - x0) * 0.5
+    for z in (z_bot, z_top):
+        for dt in (-0.25, 0.25):
+            add_box_prism(bm, at(cx, z - 0.09, dt), r_f, t_f, up, hw, 0.07, 0.18, mat_index=6)
+    n_bay = max(1, int(round((x1 - x0) / 2.5)))
+    for k in range(n_bay + 1):
+        x = x0 + (x1 - x0) * k / n_bay
+        for dt in (-0.25, 0.25):
+            add_box_prism(bm, at(x, z_bot, dt), r_f, t_f, up, 0.04, 0.04, z_top - z_bot, mat_index=6)
+        if k < n_bay:
+            xn = x0 + (x1 - x0) * (k + 1) / n_bay
+            for dt in (-0.25, 0.25):
+                a, b = (at(x, z_bot, dt), at(xn, z_top, dt)) if k % 2 == 0 else (at(x, z_top, dt), at(xn, z_bot, dt))
+                add_cylinder_between(bm, a, b, 0.035, num_segments=5, mat_index=6)
+
+
+def add_gantry_post(bm, origin, r_f, t_f, up, x, surface_z, top_z):
+    base = origin + r_f * x
+    base.z = surface_z
+    add_box_prism(bm, base - up * 0.45, r_f, t_f, up, 0.55, 0.55, 0.65, mat_index=1)  # footing
+    add_box_prism(bm, base, r_f, t_f, up, 0.18, 0.18, top_z - surface_z, mat_index=6)
+
+
+def add_gantry(bm, sample, style, carriageways, left_x, right_x, clearance, sign_h, asphalt_h, extra_signs=()):
+    """
+    Overhead sign structure at one point on the road. Everything stands upright however the road
+    is banked. carriageways: [(sign centre x, sign width, travel direction ±1, sign kind, text, road side ±1)].
+    FULL_SPAN: one truss across the whole road on two posts, each direction's sign on the side
+    facing its own traffic. CANTILEVER: per direction, one post outside the road with an arm
+    reaching over its lanes carrying a single sign.
+    """
+    pos, tang, norm, right_b = sample
+    t_f, r_f, up = flat_frame(tang)
+
+    def surface_z(x):
+        return (pos + right_b * x + norm * asphalt_h).z
+
+    road_top = max(surface_z(left_x), surface_z(right_x), surface_z(0.0))
+    z_bot = road_top + clearance
+    z_top = z_bot + sign_h
+    post_top = z_top + 0.25
+
+    def place_sign(cx, width, direction, kind, text, _side=None):
+        look = t_f * direction
+        height = sign_h * (0.82 if kind == 'LED' else 1.0)
+        depth = 0.32 if kind == 'LED' else 0.04
+        c = pos + r_f * cx - look * (0.25 + 0.07 + depth + 0.08)
+        c.z = (z_bot + z_top) * 0.5
+        add_sign_panel(bm, c, look, up, width, height, kind, text)
+
+    if style == 'CANTILEVER':
+        for cx, width, direction, kind, text, side in carriageways:
+            post_x = (right_x if side > 0 else left_x) + side * 0.8
+            far_x = cx - side * (width * 0.5 + 0.35)
+            add_gantry_post(bm, pos, r_f, t_f, up, post_x, surface_z(post_x), post_top)
+            add_truss(bm, pos, r_f, t_f, up, min(post_x, far_x), max(post_x, far_x), z_bot + 0.1, z_top - 0.1)
+            place_sign(cx, width, direction, kind, text)
+        return
+
+    post_l, post_r = left_x - 0.8, right_x + 0.8
     for x in (post_l, post_r):
-        base = p + right * x
-        add_box_prism(bm, base - normal * 0.2, right, tangent, normal, 0.5, 0.5, 0.6, mat_index=1)   # Footing
-        add_box_prism(bm, base, right, tangent, normal, 0.18, 0.18, top_h, mat_index=6)             # Post
-
-    span_c = (post_l + post_r) * 0.5
-    span_hw = (post_r - post_l) * 0.5
-    truss_off = tangent * 0.28
-    chord_z = (clearance_h + 0.15, clearance_h + sign_h + 0.15)
-    for z in chord_z:
-        add_box_prism(bm, p + right * span_c + normal * z + truss_off, right, tangent, normal,
-                      span_hw, 0.12, 0.2, mat_index=6)
-
-    n_web = max(2, int((post_r - post_l) / 2.5))
-    web_h = chord_z[1] - chord_z[0] - 0.2
-    for k in range(1, n_web):
-        x = post_l + (post_r - post_l) * k / n_web
-        add_box_prism(bm, p + right * x + normal * (chord_z[0] + 0.2) + truss_off, right, tangent, normal,
-                      0.05, 0.05, web_h, mat_index=6)
-
-    for cx, w in panels:
-        border_base = p + right * cx + normal * (clearance_h - 0.08) + tangent * 0.1
-        add_box_prism(bm, border_base, right, tangent, normal, w * 0.5 + 0.08, 0.06, sign_h + 0.16, mat_index=5)
-        face_base = p + right * cx + normal * clearance_h
-        add_box_prism(bm, face_base, right, tangent, normal, w * 0.5, 0.06, sign_h, mat_index=8)
+        add_gantry_post(bm, pos, r_f, t_f, up, x, surface_z(x), post_top)
+    add_truss(bm, pos, r_f, t_f, up, post_l, post_r, z_bot + 0.1, z_top - 0.1)
+    for sign in list(carriageways) + list(extra_signs):
+        place_sign(*sign)
 
 
 def add_streetlight_at(bm, base_p, right, tangent, normal, arm_dir, pole_h, arm_len):
-    """Steel pole on a concrete plinth with a mast arm and an emissive luminaire head."""
-    add_box_prism(bm, base_p - normal * 0.1, right, tangent, normal, 0.22, 0.22, 0.45, mat_index=1)
+    """Steel pole on a concrete plinth with a mast arm and an emissive luminaire head.
+    Pass an upright frame (see flat_frame) so the pole stands vertical on banked roads."""
+    add_box_prism(bm, base_p - normal * 0.35, right, tangent, normal, 0.22, 0.22, 0.7, mat_index=1)
     add_cylinder(bm, base_p, right, tangent, normal, radius=0.11, height=pole_h, num_segments=8, mat_index=6)
 
     arm_base = base_p + normal * (pole_h - 0.12) + right * (arm_dir * arm_len * 0.5)
@@ -716,21 +871,22 @@ def add_cable_stayed_bridge(bm, samples, half_w, tower_spacing, tower_height, de
 
     for t_idx in tower_indices:
         p_pos, tang, norm, right = samples[t_idx]
-        apex = p_pos + norm * tower_height
+        t_up, r_up, up = flat_frame(tang)  # towers stand upright even where the deck is banked
+        apex = p_pos + up * tower_height
 
         for side in (-1.0, 1.0):
             base = p_pos + right * (side * leg_x)
-            knee = base + norm * knee_h
+            knee = base + up * knee_h
             ground_pt = base.copy()
             ground_pt.z = ground_z
             if knee.z - ground_pt.z > 0.5:
                 add_cylinder_between(bm, ground_pt, knee, radius=0.95, num_segments=8, mat_index=1)
-            add_cylinder_between(bm, knee, apex + right * (side * 0.7), radius=0.8, num_segments=8, mat_index=1)
+            add_cylinder_between(bm, knee, apex + r_up * (side * 0.7), radius=0.8, num_segments=8, mat_index=1)
 
         # Lower cross-beam carrying the deck, and the apex cable anchorage block
         add_box_prism(bm, p_pos - norm * (deck_t + 1.2), right, tang, norm,
                       half_w=leg_x + 0.6, half_d=1.0, height=1.2, mat_index=1)
-        add_box_prism(bm, apex - norm * 4.0, right, tang, norm,
+        add_box_prism(bm, apex - up * 4.0, r_up, t_up, up,
                       half_w=1.5, half_d=1.1, height=5.0, mat_index=1)
 
         # High-tension steel stay cables fanning from the tower head to both deck edges
@@ -747,7 +903,7 @@ def add_cable_stayed_bridge(bm, samples, half_w, tower_spacing, tower_height, de
 
                 # Farther cables attach higher on the tower head
                 head_drop = 3.5 * (1.0 - 2.0 * abs(frac - 0.5))
-                apex_pt = apex - norm * (0.5 + head_drop) + right * (side * 0.9)
+                apex_pt = apex - up * (0.5 + head_drop) + r_up * (side * 0.9)
                 add_cylinder_between(bm, apex_pt, deck_anchor, radius=0.07, num_segments=6, mat_index=6)
 
 
@@ -759,6 +915,12 @@ def add_toll_plaza_at(bm, plaza_center, right, tangent, normal, num_lanes, booth
     lane_spacing = 3.8
     total_plaza_w = num_lanes * lane_spacing
     start_x = -total_plaza_w * 0.5
+    # Islands sit on the road surface (which may be banked); booths, columns and roof stand upright.
+    surf_right = right
+    tangent, right, normal = flat_frame(tangent)
+
+    def surface(x):
+        return plaza_center + surf_right * x
 
     # 1. Concrete Island Splitters & Toll Booth Cabins
     for l_i in range(num_lanes + 1):
@@ -766,9 +928,9 @@ def add_toll_plaza_at(bm, plaza_center, right, tangent, normal, num_lanes, booth
         if l_i == 0 or l_i == num_lanes:
             continue  # Outer bounds
 
-        island_base = plaza_center + right * island_cx + normal * asphalt_h
-        # Concrete splitter island curb
-        add_box_prism(bm, island_base, right, tangent, normal, half_w=0.65, half_d=island_l * 0.5, height=0.35, mat_index=1)
+        island_base = surface(island_cx) + normal * asphalt_h
+        # Concrete splitter island curb (sunk a little so it meets the banked surface)
+        add_box_prism(bm, island_base - normal * 0.15, right, tangent, normal, half_w=0.65, half_d=island_l * 0.5, height=0.5, mat_index=1)
         # Sloped Impact Attenuator Nose Blocks at entry/exit
         for nose_dir in (-1.0, 1.0):
             nose_base = island_base + tangent * (nose_dir * island_l * 0.45)
@@ -780,15 +942,17 @@ def add_toll_plaza_at(bm, plaza_center, right, tangent, normal, num_lanes, booth
 
     # 2. Overhead Concrete Toll Canopy Roof spanning across all lanes, carried on a pair of
     #    columns standing on each island either side of its booth.
-    canopy_z = 5.2
+    # The roof is level, 5.2 m above the highest point of the road under it.
+    canopy_world_z = max(surface(start_x).z, surface(-start_x).z, plaza_center.z) + 5.2
     col_top = asphalt_h + 0.35
     col_d = min(island_l * 0.35, 1.8 + 1.2)
     for l_i in range(1, num_lanes):
-        island_base = plaza_center + right * (start_x + l_i * lane_spacing) + normal * col_top
+        island_base = surface(start_x + l_i * lane_spacing) + normal * col_top
         for d in (-col_d, col_d):
             add_box_prism(bm, island_base + tangent * d, right, tangent, normal,
-                          half_w=0.28, half_d=0.28, height=canopy_z - col_top, mat_index=1)
-    canopy_base = plaza_center + normal * canopy_z
+                          half_w=0.28, half_d=0.28, height=canopy_world_z - island_base.z, mat_index=1)
+    canopy_base = plaza_center.copy()
+    canopy_base.z = canopy_world_z
     add_box_prism(bm, canopy_base, right, tangent, normal, half_w=total_plaza_w * 0.52, half_d=island_l * 0.65, height=0.75, mat_index=1)
 
 
@@ -997,9 +1161,11 @@ def rebuild_civil_mesh(obj, depsgraph=None):
             if post_accum >= next_post_d:
                 next_post_d = post_accum + props.guardrail_post_spacing
                 p_curr, tang, norm, right = local_samples[i]
+                t_up, r_up, up = flat_frame(tang)
                 for side, g_ext in ((-1.0, left_gore_ext[i]), (1.0, right_gore_ext[i])):
-                    post_base = p_curr + right * (side * (gr_offset + g_ext + 0.05))
-                    add_box_prism(bm, post_base, right, tang, norm, half_w=0.06, half_d=0.08, height=gr_h + 0.03, mat_index=6)
+                    post_base = p_curr + right * (side * (gr_offset + g_ext + 0.05)) + norm * asphalt_h
+                    add_box_prism(bm, post_base - up * 0.15, r_up, t_up, up,
+                                  half_w=0.06, half_d=0.08, height=gr_h + 0.18, mat_index=6)
 
     # 8. Highway Concrete Sound / Retaining Walls
     if props.add_sound_walls:
@@ -1007,14 +1173,24 @@ def rebuild_civil_mesh(obj, depsgraph=None):
         wh = props.sound_wall_height
         wt = props.sound_wall_thickness
         for side, x_list in ((-1.0, [-left_gore_ext[i] for i in range(num_s)]), (1.0, right_gore_ext)):
-            cx = side * wall_offset
-            w_prof = [
-                (cx - wt * 0.5, 0.0),
-                (cx + wt * 0.5, 0.0),
-                (cx + wt * 0.5, wh),
-                (cx - wt * 0.5, wh),
-            ]
-            add_extruded_profile(bm, local_samples, w_prof, mat_index=3, x_offsets=x_list)
+            # Walls stand vertical: each cross-section is a rectangle on the road edge, raised straight up.
+            rings = []
+            for i, (pos, tang, norm, right) in enumerate(local_samples):
+                _, _, up = flat_frame(tang)
+                cx = side * wall_offset + x_list[i]
+                a = pos + right * (cx - wt * 0.5) - up * 0.3
+                b = pos + right * (cx + wt * 0.5) - up * 0.3
+                top = max(a.z, b.z) + wh + 0.3
+                a_top, b_top = a.copy(), b.copy()
+                a_top.z = b_top.z = top
+                rings.append([bm.verts.new(q) for q in (a, b, b_top, a_top)])
+            for i in range(len(rings) - 1):
+                r1, r2 = rings[i], rings[i + 1]
+                for j in range(4):
+                    jn = (j + 1) % 4
+                    bm.faces.new((r1[j], r1[jn], r2[jn], r2[j])).material_index = 3
+            for ring in (rings[0], list(reversed(rings[-1]))):
+                bm.faces.new(ring).material_index = 3
 
     # 9. Lane Markings
     if props.add_lane_markings and (props.lanes_left > 0 or props.lanes_right > 0):
@@ -1100,41 +1276,54 @@ def rebuild_civil_mesh(obj, depsgraph=None):
     if props.add_gantry_signs and total_w > 0.5:
         gantry_accum = 0.0
         next_gantry_d = props.gantry_spacing * 0.45
+        g_index = 0
+        sw = props.sidewalk_width if props.add_sidewalks else 0.0
+        # Right lanes travel along the curve with right-hand traffic, against it with left-hand.
+        fwd = -1.0 if props.traffic_left_hand else 1.0
 
         for i in range(num_s):
             if i > 0:
                 gantry_accum += (local_samples[i][0] - local_samples[i - 1][0]).length
-            if gantry_accum >= next_gantry_d:
-                next_gantry_d = gantry_accum + props.gantry_spacing
-                if is_inside_tunnel(i):
+            if gantry_accum < next_gantry_d:
+                continue
+            next_gantry_d = gantry_accum + props.gantry_spacing
+            if is_inside_tunnel(i):
+                continue
+
+            sign_type = props.gantry_sign_type
+            if sign_type == 'ALTERNATE':
+                sign_type = 'GUIDE' if g_index % 2 == 0 else 'LED'
+            text_spec = props.led_sign_text if sign_type == 'LED' else props.guide_sign_text
+
+            carriageways = []
+            for n_lanes, cx, direction, side in (
+                (props.lanes_right, half_w - props.shoulder_width - props.lanes_right * props.lane_width * 0.5, fwd, 1.0),
+                (props.lanes_left, -half_w + props.shoulder_width + props.lanes_left * props.lane_width * 0.5, -fwd, -1.0),
+            ):
+                if n_lanes <= 0:
                     continue
+                span = n_lanes * props.lane_width
+                if props.gantry_style == 'CANTILEVER':
+                    # One sign over the outer lanes, on a short arm from the roadside post.
+                    width = min(span * 0.9, max(3.4, props.lane_width * 1.15), 6.0)
+                    cx = cx + side * (span * 0.5 - width * 0.5 - 0.2)
+                elif sign_type == 'LED':
+                    width = min(max(3.2, span * 0.72), 10.0)
+                else:
+                    width = min(max(2.8, span * 0.78), 12.0)
+                text = sign_message(text_spec, g_index + len(carriageways))
+                carriageways.append((cx, width, direction, sign_type, text, side))
 
-                p_curr, tang, norm, right = local_samples[i]
-                lx = left_road_edges[i] - (props.sidewalk_width if props.add_sidewalks else 0.0)
-                rx = right_road_edges[i] + (props.sidewalk_width if props.add_sidewalks else 0.0)
+            extra = []
+            if props.gantry_style == 'FULL_SPAN' and right_gore_ext[i] > 1.8:
+                extra.append((half_w + right_gore_ext[i] * 0.55, min(3.8, right_gore_ext[i] * 0.85), fwd,
+                              'GUIDE', "EXIT", 1.0))
 
-                panels = []
-                if props.lanes_right > 0:
-                    r_w = max(2.8, props.lanes_right * props.lane_width * 0.78)
-                    r_cx = half_w - props.shoulder_width - (props.lanes_right * props.lane_width * 0.5)
-                    panels.append((r_cx, r_w))
-                if props.lanes_left > 0:
-                    l_w = max(2.8, props.lanes_left * props.lane_width * 0.78)
-                    l_cx = -half_w + props.shoulder_width + (props.lanes_left * props.lane_width * 0.5)
-                    panels.append((l_cx, l_w))
-                if right_gore_ext[i] > 1.8:
-                    panels.append((half_w + right_gore_ext[i] * 0.55, min(3.8, right_gore_ext[i] * 0.85)))
-
-                if not panels:
-                    panels.append((0.0, max(3.0, total_w * 0.6)))
-
-                add_gantry_sign_at(
-                    bm, p_curr, right, tang, norm,
-                    left_x=lx, right_x=rx,
-                    clearance_h=props.gantry_clearance,
-                    sign_h=props.gantry_sign_height,
-                    panels=panels
-                )
+            add_gantry(bm, local_samples[i], props.gantry_style, carriageways,
+                       left_x=left_road_edges[i] - sw, right_x=right_road_edges[i] + sw,
+                       clearance=props.gantry_clearance, sign_h=props.gantry_sign_height,
+                       asphalt_h=asphalt_h, extra_signs=extra)
+            g_index += 1
 
     # 13. Highway Streetlights
     if props.add_streetlights:
@@ -1152,23 +1341,24 @@ def rebuild_civil_mesh(obj, depsgraph=None):
                     continue
 
                 p_curr, tang, norm, right = local_samples[i]
+                t_up, r_up, up = flat_frame(tang)  # poles stand vertical on banked roads
 
                 if props.streetlight_placement == 'BOTH':
                     for side, g_ext in ((-1.0, left_gore_ext[i]), (1.0, right_gore_ext[i])):
-                        base_p = p_curr + right * (side * (pole_offset + g_ext))
-                        add_streetlight_at(bm, base_p, right, tang, norm, arm_dir=-side,
+                        base_p = p_curr + right * (side * (pole_offset + g_ext)) + norm * asphalt_h
+                        add_streetlight_at(bm, base_p, r_up, t_up, up, arm_dir=-side,
                                            pole_h=props.streetlight_height, arm_len=props.streetlight_arm_length)
                 elif props.streetlight_placement == 'ALTERNATING':
                     side = -1.0 if (pole_idx % 2 == 0) else 1.0
                     g_ext = left_gore_ext[i] if side < 0 else right_gore_ext[i]
-                    base_p = p_curr + right * (side * (pole_offset + g_ext))
-                    add_streetlight_at(bm, base_p, right, tang, norm, arm_dir=-side,
+                    base_p = p_curr + right * (side * (pole_offset + g_ext)) + norm * asphalt_h
+                    add_streetlight_at(bm, base_p, r_up, t_up, up, arm_dir=-side,
                                        pole_h=props.streetlight_height, arm_len=props.streetlight_arm_length)
                 elif props.streetlight_placement == 'MEDIAN':
                     base_p = p_curr + right * med_center_x + norm * asphalt_h
-                    add_streetlight_at(bm, base_p, right, tang, norm, arm_dir=-1.0,
+                    add_streetlight_at(bm, base_p, r_up, t_up, up, arm_dir=-1.0,
                                        pole_h=props.streetlight_height, arm_len=props.streetlight_arm_length)
-                    add_streetlight_at(bm, base_p, right, tang, norm, arm_dir=1.0,
+                    add_streetlight_at(bm, base_p, r_up, t_up, up, arm_dir=1.0,
                                        pole_h=props.streetlight_height, arm_len=props.streetlight_arm_length)
                 pole_idx += 1
 
@@ -1215,13 +1405,17 @@ def rebuild_civil_mesh(obj, depsgraph=None):
     if loose:
         bmesh.ops.delete(bm, geom=loose, context='VERTS')
 
-    bmesh.ops.recalc_face_normals(bm, faces=bm.faces)
+    # Sign lettering is open, flat geometry already facing the reader; leave it out of the recalculation.
+    bmesh.ops.recalc_face_normals(bm, faces=[f for f in bm.faces if not f.tag])
     bm.to_mesh(obj.data)
     bm.free()
     obj.data.update()
 
-    # Keep this road's traffic lanes on the road as it changes.
-    traffic.update_lane_curves(obj, local_samples)
+    # Roads continuing from this one stay on its end.
+    rebuild_attached_roads(obj, depsgraph)
+
+    # Keep the traffic routes that run over this road on it as it changes.
+    traffic.update_routes(obj, local_samples, depsgraph)
 
 
 # ==============================================================================
@@ -1300,6 +1494,58 @@ def write_segments_to_curve(curve_obj, segments):
     cu.update_tag()
 
 
+def road_end_frame(road, at_end=True, depsgraph=None):
+    """(world position, horizontal heading in radians) of the road centreline's end or start."""
+    samples = sample_bezier_curve(road.civil_props.target_curve, 1.0, use_spline_tilt=False, depsgraph=depsgraph)
+    if len(samples) < 2:
+        return None
+    pos, tan, _, _ = samples[-1] if at_end else samples[0]
+    return pos, math.atan2(tan.y, tan.x)
+
+
+def snap_start_to_end(road, target, depsgraph=None):
+    """Moves and turns road's guide curve so the road starts where target ends. True if it moved."""
+    end = road_end_frame(target, True, depsgraph)
+    start = road_end_frame(road, False, depsgraph)
+    if end is None or start is None:
+        return False
+    (end_pos, end_h), (start_pos, start_h) = end, start
+    turn = math.remainder(end_h - start_h, math.tau)
+    if (end_pos - start_pos).length < 1e-4 and abs(turn) < 1e-5:
+        return False
+    xform = Matrix.Translation(end_pos) @ Matrix.Rotation(turn, 4, 'Z') @ Matrix.Translation(-start_pos)
+    curve = road.civil_props.target_curve
+    curve.matrix_world = xform @ curve.matrix_world
+    return True
+
+
+_following = set()
+
+
+def follow_attached(road, depsgraph=None):
+    """Puts `road` back on the end of the road it continues from, then rebuilds it."""
+    p = road.civil_props
+    if p.attached_to is None or p.target_curve is None or road.name in _following:
+        return
+    if p.attached_to.civil_props.target_curve in (None, p.target_curve):
+        return
+    _following.add(road.name)
+    try:
+        snap_start_to_end(road, p.attached_to, depsgraph)
+        rebuild_civil_mesh(road, depsgraph=depsgraph)
+    finally:
+        _following.discard(road.name)
+
+
+def rebuild_attached_roads(road, depsgraph=None):
+    """Roads that continue from `road` follow its end (and theirs follow them, and so on)."""
+    if road.name in _following and len(_following) > 50:
+        return
+    for o in bpy.data.objects:
+        if o.type == 'MESH' and o.civil_props.is_civil_object and o.civil_props.attached_to == road:
+            follow_attached(o, depsgraph)
+
+
 def regenerate_from_segments(obj, context):
     p = obj.civil_props
     if not (p.is_civil_object and p.use_segments and p.target_curve and len(p.segments)):
@@ -1347,6 +1593,16 @@ class CIVIL_PG_ObjectProps(bpy.types.PropertyGroup):
         name="Mesh Step", default=2.0, min=0.5, max=20.0, unit='LENGTH',
         description="Distance between cross-sections along the curve. Smaller is smoother but heavier",
         update=update_civil_prop
+    )
+
+    # The road this one carries on from: its start stays on that road's end.
+    attached_to: bpy.props.PointerProperty(
+        name="Continues From",
+        type=bpy.types.Object,
+        description="This road's start stays on the end of this road, following it when it changes. "
+                    "Clear it to move the road freely",
+        poll=lambda self, o: (o.type == 'MESH' and o.civil_props.is_civil_object and o != self.id_data),
+        update=lambda self, context: follow_attached(self.id_data, context.evaluated_depsgraph_get())
     )
 
     # Segment builder
@@ -1487,6 +1743,41 @@ class CIVIL_PG_ObjectProps(bpy.types.PropertyGroup):
     )
     gantry_clearance: bpy.props.FloatProperty(
         name="Vertical Clearance", default=6.2, min=4.5, max=12.0, unit='LENGTH',
+        update=update_civil_prop
+    )
+    gantry_style: bpy.props.EnumProperty(
+        name="Gantry Style",
+        items=[
+            ('FULL_SPAN', "Full Span", "One truss across the whole road on two posts"),
+            ('CANTILEVER', "Single Sign (Cantilever)",
+             "For each direction, one post beside the road with an arm reaching over its lanes and one sign"),
+        ],
+        default='FULL_SPAN',
+        update=update_civil_prop
+    )
+    gantry_sign_type: bpy.props.EnumProperty(
+        name="Signs",
+        items=[
+            ('GUIDE', "Guide Signs", "Green direction signs"),
+            ('LED', "LED Message Signs", "Electronic signs with amber messages about traffic and hazards"),
+            ('ALTERNATE', "Alternate", "Guide signs and LED message signs on alternating gantries"),
+        ],
+        default='GUIDE',
+        update=update_civil_prop
+    )
+    guide_sign_text: bpy.props.StringProperty(
+        name="Guide Text",
+        default="EXIT 24|Downtown;Airport|Next Right;Interstate 5|North",
+        description="Lettering on guide signs. Use | for a new line and ; between signs; each sign "
+                    "along the road takes the next one",
+        update=update_civil_prop
+    )
+    led_sign_text: bpy.props.StringProperty(
+        name="LED Messages",
+        default="ACCIDENT AHEAD|LEFT LANE CLOSED;TRAFFIC AHEAD|EXPECT DELAYS;ROAD WORK|NEXT 2 MILES;"
+                "SLOW DOWN|FOG AHEAD",
+        description="Messages on LED signs. Use | for a new line and ; between messages; each sign "
+                    "along the road shows the next one",
         update=update_civil_prop
     )
     gantry_sign_height: bpy.props.FloatProperty(
@@ -1823,6 +2114,105 @@ class CIVIL_OT_CreateRoadPreset(bpy.types.Operator):
         return {'FINISHED'}
 
 
+LANE_SETUP_PROPS = ("lanes_left", "lanes_right", "lane_width", "shoulder_width", "median_width",
+                    "traffic_speed", "traffic_left_hand")
+
+
+class CIVIL_OT_RoadContinue(bpy.types.Operator):
+    bl_idname = "civil.road_continue"
+    bl_label = "New Road From End"
+    bl_description = ("Start a new road where the active road ends, heading the same way. "
+                      "Its traffic will flow on from this road")
+    bl_options = {'REGISTER', 'UNDO'}
+
+    preset_type: bpy.props.EnumProperty(
+        name="Road Type",
+        items=[
+            ('HIGHWAY', "Highway", "Divided highway with embankments"),
+            ('OVERPASS', "Overpass", "Elevated deck on piers"),
+            ('CABLE_BRIDGE', "Cable-Stayed Bridge", "Deck hung from A-frame towers"),
+            ('TUNNEL', "Tunnel", "Road through an arched tunnel"),
+            ('STREET', "City Street", "Two-lane street with sidewalks"),
+        ],
+        default='HIGHWAY'
+    )
+    length: bpy.props.FloatProperty(name="Length", default=100.0, min=5.0, max=2000.0, unit='LENGTH')
+    bend: bpy.props.FloatProperty(name="Bend", default=0.0, min=-180.0, max=180.0, step=100, precision=1)
+    rise: bpy.props.FloatProperty(name="Rise", default=0.0, min=-100.0, max=100.0, unit='LENGTH',
+                                  description="Height gained (or lost) over the new road")
+    match_lanes: bpy.props.BoolProperty(
+        name="Match Lanes", default=True,
+        description="Give the new road the same lanes, widths and traffic settings as the one it continues"
+    )
+
+    @classmethod
+    def poll(cls, context):
+        obj = context.active_object
+        return bool(obj and obj.type == 'MESH' and obj.civil_props.is_civil_object and obj.civil_props.target_curve)
+
+    def execute(self, context):
+        prev = context.active_object
+        frame = road_end_frame(prev, at_end=True)
+        if frame is None:
+            self.report({'WARNING'}, "The active road has no usable guide curve.")
+            return {'CANCELLED'}
+        end_pos, heading = frame
+
+        for o in context.selected_objects:
+            o.select_set(False)
+        context.view_layer.objects.active = None
+        bpy.ops.civil.create_road_preset(preset_type=self.preset_type, length=self.length,
+                                         bend=self.bend, elevation=0.0)
+        road = context.active_object
+        p = road.civil_props
+        p.is_civil_object = False  # hold rebuilds while the new road is set up
+        try:
+            if self.match_lanes:
+                for name in LANE_SETUP_PROPS:
+                    setattr(p, name, getattr(prev.civil_props, name))
+            if len(p.segments):
+                p.segments[0].rise = self.rise
+            p.add_toll_plaza = False  # one plaza per highway is plenty
+            curve = p.target_curve
+            curve.location = end_pos
+            curve.rotation_euler = (0.0, 0.0, heading)
+            p.attached_to = prev
+        finally:
+            p.is_civil_object = True
+        if len(p.segments):
+            write_segments_to_curve(p.target_curve, p.segments)
+        rebuild_civil_mesh(road, depsgraph=context.evaluated_depsgraph_get())
+        return {'FINISHED'}
+
+
+class CIVIL_OT_RoadSnap(bpy.types.Operator):
+    bl_idname = "civil.road_snap"
+    bl_label = "Join Roads"
+    bl_description = ("Select two roads: moves and turns the active road so it starts exactly where "
+                      "the other one ends, and keeps it there when the other road changes. "
+                      "Their lanes and traffic link up")
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        sel = [o for o in context.selected_objects if o.type == 'MESH' and o.civil_props.is_civil_object]
+        act = context.active_object
+        return len(sel) == 2 and act in sel
+
+    def execute(self, context):
+        act = context.active_object
+        other = next(o for o in context.selected_objects if o != act and o.type == 'MESH')
+        if act.civil_props.target_curve == other.civil_props.target_curve:
+            self.report({'WARNING'}, "Both roads use the same guide curve.")
+            return {'CANCELLED'}
+        if road_end_frame(other) is None or road_end_frame(act, False) is None:
+            self.report({'WARNING'}, "Both roads need a usable guide curve.")
+            return {'CANCELLED'}
+        # Attaching snaps the road onto the other's end and keeps it there from now on.
+        act.civil_props.attached_to = other
+        return {'FINISHED'}
+
+
 def active_segment_road(context):
     obj = context.active_object
     if obj and obj.type == 'MESH' and obj.civil_props.is_civil_object and obj.civil_props.use_segments:
@@ -2109,6 +2499,7 @@ class CIVIL_PT_MainPanel(bpy.types.Panel):
         layout.separator()
         row = layout.row(align=True)
         row.operator("civil.create_interchange_ramp", text="Bridge Selected Roads (Ramp)", icon='IPO_BEZIER')
+        layout.operator("civil.road_snap", text="Join Active Road to Other's End", icon='SNAP_ON')
         layout.operator("civil.refresh_all", text="Rebuild All From Curves", icon='FILE_REFRESH')
 
         if obj and obj.type == 'MESH' and obj.civil_props.is_civil_object:
@@ -2147,6 +2538,8 @@ class CIVIL_PT_MainPanel(bpy.types.Panel):
                 op.kind = 'RIGHT'
             elif not len(props.segments):
                 r_box.label(text="Shaped by hand on its guide curve", icon='INFO')
+            r_box.operator_menu_enum("civil.road_continue", "preset_type", text="New Road From End", icon='FORWARD')
+            r_box.prop(props, "attached_to", icon='LINKED')
 
             # Banking & Superelevation
             t_box = layout.box()
@@ -2239,6 +2632,12 @@ class CIVIL_PT_MainPanel(bpy.types.Panel):
             g_box.label(text="Gantry Signs & Streetlights", icon='LIGHT_SPOT')
             g_box.prop(props, "add_gantry_signs")
             if props.add_gantry_signs:
+                g_box.prop(props, "gantry_style")
+                g_box.prop(props, "gantry_sign_type")
+                if props.gantry_sign_type in ('GUIDE', 'ALTERNATE'):
+                    g_box.prop(props, "guide_sign_text", text="Guide")
+                if props.gantry_sign_type in ('LED', 'ALTERNATE'):
+                    g_box.prop(props, "led_sign_text", text="LED")
                 g_box.prop(props, "gantry_spacing")
                 row = g_box.row(align=True)
                 row.prop(props, "gantry_clearance")
@@ -2270,7 +2669,11 @@ class CIVIL_PT_MainPanel(bpy.types.Panel):
             if has_traffic:
                 row.operator("civil.traffic_remove", icon='TRASH', text="")
                 n = sum(1 for o in props.traffic_collection.objects if o.get("cf_kind"))
-                tr_box.label(text=f"{n} vehicles. Press Space to play.", icon='INFO')
+                n_roads = len(traffic.roads_sharing_traffic(props.traffic_collection))
+                linked = f" on {n_roads} linked roads" if n_roads > 1 else ""
+                tr_box.label(text=f"{n} vehicles{linked}. Press Space to play.", icon='INFO')
+            else:
+                tr_box.label(text="Roads whose ends meet share their traffic", icon='LINKED')
 
             # Overpass Piers
             o_box = layout.box()
@@ -2328,6 +2731,8 @@ classes = (
     CIVIL_OT_CreateRoadPreset,
     CIVIL_OT_SegmentAdd,
     CIVIL_OT_SegmentRemove,
+    CIVIL_OT_RoadContinue,
+    CIVIL_OT_RoadSnap,
     CIVIL_UL_Segments,
     CIVIL_OT_CreateInterchangeRamp,
     CIVIL_OT_RefreshAll,
