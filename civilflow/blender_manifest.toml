@@ -1,0 +1,14 @@
+schema_version = "1.0.0"
+
+id = "civilflow"
+version = "1.5.1"
+name = "CivilFlow: Road, Highway & Overpass Generator"
+tagline = "Procedural roads, bridges, tunnels and toll plazas from curves"
+maintainer = "AI Assistant"
+type = "add-on"
+
+tags = ["Add Mesh", "Modeling"]
+
+blender_version_min = "5.1.0"
+
+license = ["SPDX:GPL-3.0-or-later"]
