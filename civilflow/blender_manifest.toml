@@ -1,7 +1,7 @@
 schema_version = "1.0.0"
 
 id = "civilflow"
-version = "1.5.1"
+version = "1.6.0"
 name = "CivilFlow: Road, Highway & Overpass Generator"
 tagline = "Procedural roads, bridges, tunnels and toll plazas from curves"
 maintainer = "AI Assistant"
@@ -12,3 +12,6 @@ tags = ["Add Mesh", "Modeling"]
 blender_version_min = "5.1.0"
 
 license = ["SPDX:GPL-3.0-or-later"]
+
+[build]
+paths_exclude_pattern = ["__pycache__/", "/.git/", "*.zip", "._*", ".DS_Store"]

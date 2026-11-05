@@ -1,10 +1,10 @@
 bl_info = {
     "name": "CivilFlow: Road, Highway & Overpass Generator",
     "author": "AI Assistant",
-    "version": (1, 5, 1),
+    "version": (1, 6, 0),
     "blender": (5, 1, 0),
     "location": "View3D > Sidebar (N) > CivilEng",
-    "description": "Procedural roads, highways, banking, guardrails, gantry signs, tunnels, embankments, cable-stayed towers, and toll plazas.",
+    "description": "Procedural roads built from straights and curves, highways, banking, guardrails, gantry signs, tunnels, embankments, cable-stayed towers, and toll plazas.",
     "category": "Add Mesh",
 }
 
@@ -120,6 +120,32 @@ def extract_spline_control_tilts(curve_obj):
     return pts
 
 
+def control_point_arc_fractions(curve_obj, ctrl_pts, verts, cum_lengths):
+    """
+    Where each control point sits along the evaluated curve, as a 0..1 fraction of its true
+    arc length. A non-cyclic Bezier spline evaluates to resolution_u points per segment, so
+    control point k is evaluated vertex k * resolution_u. Other spline types fall back to
+    spacing the control points by the straight-line distance between them.
+    """
+    total = max(1e-6, cum_lengths[-1])
+    spline = curve_obj.data.splines[0]
+    n = len(ctrl_pts)
+    if spline.type == 'BEZIER' and not spline.use_cyclic_u:
+        res = spline.resolution_u
+        if len(verts) == (n - 1) * res + 1:
+            # The polyline walk may start from either end of the spline.
+            reverse = (verts[0] - ctrl_pts[0][0]).length > (verts[0] - ctrl_pts[-1][0]).length
+            if reverse:
+                return [cum_lengths[(n - 1 - k) * res] / total for k in range(n)]
+            return [cum_lengths[k * res] / total for k in range(n)]
+
+    c_dists = [0.0]
+    for i in range(1, n):
+        c_dists.append(c_dists[-1] + (ctrl_pts[i][0] - ctrl_pts[i - 1][0]).length)
+    c_total = max(1e-6, c_dists[-1])
+    return [d / c_total for d in c_dists]
+
+
 def sample_bezier_curve(curve_obj, step_distance, use_spline_tilt=True, auto_bank=False, auto_bank_factor=1.0, max_bank_deg=12.0, depsgraph=None):
     """
     Samples a Blender Curve object in world space and applies spline point tilt (Ctrl+T)
@@ -154,12 +180,10 @@ def sample_bezier_curve(curve_obj, step_distance, use_spline_tilt=True, auto_ban
     ctrl_pts = extract_spline_control_tilts(curve_obj) if use_spline_tilt else []
     ctrl_arc_tilts = []
     if len(ctrl_pts) >= 2:
-        c_dists = [0.0]
-        for i in range(1, len(ctrl_pts)):
-            c_dists.append(c_dists[-1] + (ctrl_pts[i][0] - ctrl_pts[i - 1][0]).length)
-        c_total = max(1e-6, c_dists[-1])
-        for i, (_, tilt_val) in enumerate(ctrl_pts):
-            ctrl_arc_tilts.append((c_dists[i] / c_total, tilt_val))
+        ctrl_fracs = control_point_arc_fractions(curve_obj, ctrl_pts, verts, cum_lengths)
+        for frac, (_, tilt_val) in zip(ctrl_fracs, ctrl_pts):
+            ctrl_arc_tilts.append((frac, tilt_val))
+        ctrl_arc_tilts.sort(key=lambda ft: ft[0])
 
     def eval_ctrl_tilt(u_norm):
         if not ctrl_arc_tilts:
@@ -480,37 +504,40 @@ def add_exit_gore_striping(bm, samples, base_x, side, gore_widths, asphalt_h, li
         add_slab(bm, pts, norm, 0.012, mat_index=5)
 
 
-def add_embankment_slopes(bm, samples, left_edges, right_edges, ground_z, mat_index=9):
+def add_embankment_slopes(bm, samples, left_edges, right_edges, ground_z, verge_w=0.0, mat_index=9):
     """
     Constructs sloped earth berms (embankments) from the outer road edges down to ground_z.
+    A flat verge of `verge_w` runs from the asphalt edge out past the sidewalks, barriers,
+    walls and posts before the slope starts, so the slope never cuts through them.
     """
     if len(samples) < 2:
         return
 
-    # We build left and right embankment strips
+    verge_z = -0.01  # just under the sidewalk underside, so the two never z-fight
     for side, edge_list in ((-1.0, left_edges), (1.0, right_edges)):
         rings = []
         for i, (pos, tangent, normal, right) in enumerate(samples):
             ex = edge_list[i]
-            world_top = pos + right * ex
-            # Calculate Z elevation drop to ground_z
+            world_edge = pos + right * ex + normal * verge_z
+            world_top = world_edge + right * (side * verge_w)
             dz = world_top.z - ground_z
             berm_w = abs(dz) * 1.75 + 1.5  # 1.75:1 slope ratio
-            world_toe = world_top + right * (side * berm_w)
+            # Run the slope horizontally outward, even when the road is banked.
+            out = Vector((right.x, right.y, 0.0))
+            out = out.normalized() if out.length > 1e-6 else Vector((1.0, 0.0, 0.0))
+            world_toe = world_top + out * (side * berm_w)
             world_toe.z = ground_z
-
-            v_top = bm.verts.new(world_top)
-            v_toe = bm.verts.new(world_toe)
-            rings.append((v_top, v_toe))
+            rings.append([bm.verts.new(p) for p in (world_edge, world_top, world_toe)])
 
         for i in range(len(rings) - 1):
-            t1, toe1 = rings[i]
-            t2, toe2 = rings[i + 1]
-            try:
-                f = bm.faces.new((t1, t2, toe2, toe1) if side > 0 else (t1, toe1, toe2, t2))
-                f.material_index = mat_index
-            except ValueError:
-                pass
+            a, b = rings[i], rings[i + 1]
+            for k in range(2):
+                quad = (a[k], b[k], b[k + 1], a[k + 1]) if side > 0 else (a[k], a[k + 1], b[k + 1], b[k])
+                try:
+                    f = bm.faces.new(quad)
+                    f.material_index = mat_index
+                except ValueError:
+                    pass
 
 
 def add_tunnel_section(bm, samples, left_edges, right_edges, clearance_h, wall_t, arched, asphalt_h):
@@ -719,8 +746,16 @@ def add_toll_plaza_at(bm, plaza_center, right, tangent, normal, num_lanes, booth
         booth_base = island_base + normal * 0.35
         add_box_prism(bm, booth_base, right, tangent, normal, half_w=booth_w * 0.5, half_d=1.8, height=2.8, mat_index=1)
 
-    # 2. Overhead Concrete Toll Canopy Roof spanning across all lanes
+    # 2. Overhead Concrete Toll Canopy Roof spanning across all lanes, carried on a pair of
+    #    columns standing on each island either side of its booth.
     canopy_z = 5.2
+    col_top = asphalt_h + 0.35
+    col_d = min(island_l * 0.35, 1.8 + 1.2)
+    for l_i in range(1, num_lanes):
+        island_base = plaza_center + right * (start_x + l_i * lane_spacing) + normal * col_top
+        for d in (-col_d, col_d):
+            add_box_prism(bm, island_base + tangent * d, right, tangent, normal,
+                          half_w=0.28, half_d=0.28, height=canopy_z - col_top, mat_index=1)
     canopy_base = plaza_center + normal * canopy_z
     add_box_prism(bm, canopy_base, right, tangent, normal, half_w=total_plaza_w * 0.52, half_d=island_l * 0.65, height=0.75, mat_index=1)
 
@@ -835,7 +870,19 @@ def rebuild_civil_mesh(obj, depsgraph=None):
 
     # 2. Terrain Cut-and-Fill Embankment Slopes (Berms)
     if props.add_embankments and not props.is_overpass:
-        add_embankment_slopes(bm, local_samples, left_road_edges, right_road_edges, ground_z=local_ground_z, mat_index=9)
+        # Clear everything built beside the asphalt before the slope starts.
+        sw = props.sidewalk_width if props.add_sidewalks else 0.0
+        verge = sw + 0.5
+        if props.add_side_barriers:
+            verge = max(verge, sw + 0.4)
+        if props.add_streetlights and props.streetlight_placement != 'MEDIAN':
+            verge = max(verge, sw + 0.8)
+        if props.add_sound_walls:
+            verge = max(verge, sw + 0.45 + props.sound_wall_thickness * 0.5)
+        if props.add_gantry_signs:
+            verge = max(verge, sw + 1.3)
+        add_embankment_slopes(bm, local_samples, left_road_edges, right_road_edges,
+                              ground_z=local_ground_z, verge_w=verge, mat_index=9)
 
     # 3. Exit Gore Channelizing V-Lines & Chevron Markings
     if props.add_exit_gore and total_w > 0.1:
@@ -1123,6 +1170,105 @@ def update_civil_prop(self, context):
         rebuild_civil_mesh(obj, depsgraph=dg)
 
 
+# ------------------------------------------------------------------------------
+# Segment builder: a road described as a chain of straights and arcs
+# ------------------------------------------------------------------------------
+
+def segment_chain_nodes(segments):
+    """
+    Turns a chain of (length, bend, rise) segments into Bezier nodes in curve-local space.
+    The chain starts at the origin heading +X. Positive bend turns left. Arcs are split into
+    pieces of at most 90 degrees so the Bezier circle approximation stays accurate.
+    Returns a list of (co, heading, handle_in_len, handle_out_len, grade_in, grade_out).
+    """
+    pos = Vector((0.0, 0.0, 0.0))
+    heading = 0.0
+    nodes = [[pos.copy(), heading, 0.0, 0.0, None, None]]
+    for seg in segments:
+        length = max(0.1, seg.length)
+        theta = math.radians(seg.bend)
+        grade = seg.rise / length
+        n_sub = max(1, math.ceil(abs(seg.bend) / 90.0 - 1e-6))
+        sub_len = length / n_sub
+        sub_theta = theta / n_sub
+        for _ in range(n_sub):
+            if abs(sub_theta) < 1e-4:
+                step = Vector((math.cos(heading), math.sin(heading), 0.0)) * sub_len
+                handle = sub_len / 3.0
+                new_heading = heading
+            else:
+                radius = sub_len / abs(sub_theta)
+                chord = 2.0 * radius * math.sin(abs(sub_theta) * 0.5)
+                mid = heading + sub_theta * 0.5
+                step = Vector((math.cos(mid), math.sin(mid), 0.0)) * chord
+                handle = (4.0 / 3.0) * math.tan(abs(sub_theta) / 4.0) * radius
+                new_heading = heading + sub_theta
+            nodes[-1][3] = handle
+            nodes[-1][5] = grade
+            pos = pos + step + Vector((0.0, 0.0, grade * sub_len))
+            nodes.append([pos.copy(), new_heading, handle, 0.0, grade, None])
+            heading = new_heading
+    return nodes
+
+
+def write_segments_to_curve(curve_obj, segments):
+    """Replaces the guide curve's shape with the segment chain (in the curve object's local space)."""
+    if not segments:
+        return
+    nodes = segment_chain_nodes(segments)
+    cu = curve_obj.data
+    cu.splines.clear()
+    cu.dimensions = '3D'
+    cu.resolution_u = 32
+    spline = cu.splines.new('BEZIER')
+    spline.bezier_points.add(len(nodes) - 1)
+    for i, (co, heading, h_in, h_out, g_in, g_out) in enumerate(nodes):
+        grades = [g for g in (g_in, g_out) if g is not None]
+        g = sum(grades) / len(grades) if grades else 0.0
+        d = Vector((math.cos(heading), math.sin(heading), g))
+        bp = spline.bezier_points[i]
+        bp.handle_left_type = 'FREE'
+        bp.handle_right_type = 'FREE'
+        bp.co = co
+        bp.handle_left = co - d * (h_in if h_in > 0 else h_out)
+        bp.handle_right = co + d * (h_out if h_out > 0 else h_in)
+    cu.update_tag()
+
+
+def regenerate_from_segments(obj, context):
+    p = obj.civil_props
+    if not (p.is_civil_object and p.use_segments and p.target_curve and len(p.segments)):
+        return
+    write_segments_to_curve(p.target_curve, p.segments)
+    dg = context.evaluated_depsgraph_get() if context else None
+    rebuild_civil_mesh(obj, depsgraph=dg)
+
+
+def update_segment(self, context):
+    obj = self.id_data
+    if obj and obj.type == 'MESH':
+        regenerate_from_segments(obj, context)
+
+
+class CIVIL_PG_Segment(bpy.types.PropertyGroup):
+    length: bpy.props.FloatProperty(
+        name="Length", default=60.0, min=1.0, max=2000.0, unit='LENGTH',
+        description="Length of this piece of road, measured along its centreline",
+        update=update_segment
+    )
+    bend: bpy.props.FloatProperty(
+        name="Bend", default=0.0, min=-180.0, max=180.0, step=100, precision=1,
+        description="How far the road turns over this piece, in degrees. 0 is a straight; "
+                    "positive turns left, negative turns right",
+        update=update_segment
+    )
+    rise: bpy.props.FloatProperty(
+        name="Rise", default=0.0, min=-100.0, max=100.0, unit='LENGTH',
+        description="Height gained (or lost, if negative) over this piece",
+        update=update_segment
+    )
+
+
 class CIVIL_PG_ObjectProps(bpy.types.PropertyGroup):
     is_civil_object: bpy.props.BoolProperty(name="Is Civil Object", default=False)
 
@@ -1133,10 +1279,20 @@ class CIVIL_PG_ObjectProps(bpy.types.PropertyGroup):
         update=update_civil_prop
     )
     resolution_step: bpy.props.FloatProperty(
-        name="Segment Length", default=2.0, min=0.5, max=20.0, unit='LENGTH',
-        description="Distance between cross-section segments along the curve",
+        name="Mesh Step", default=2.0, min=0.5, max=20.0, unit='LENGTH',
+        description="Distance between cross-sections along the curve. Smaller is smoother but heavier",
         update=update_civil_prop
     )
+
+    # Segment builder
+    use_segments: bpy.props.BoolProperty(
+        name="Shape From Segments", default=False,
+        description="Drive the guide curve from the segment list below. Changing a segment "
+                    "replaces the curve's shape, including any hand edits and Ctrl+T tilt",
+        update=lambda self, context: regenerate_from_segments(self.id_data, context)
+    )
+    segments: bpy.props.CollectionProperty(type=CIVIL_PG_Segment)
+    active_segment: bpy.props.IntProperty(name="Active Segment", default=0, min=0)
 
     # Curve Banking & Superelevation
     use_spline_tilt: bpy.props.BoolProperty(
@@ -1427,22 +1583,35 @@ class CIVIL_OT_CreateRoadPreset(bpy.types.Operator):
         ],
         default='HIGHWAY'
     )
+    length: bpy.props.FloatProperty(
+        name="Length", default=100.0, min=5.0, max=2000.0, unit='LENGTH',
+        description="Length of the first piece of road (ignored when building on a selected curve)"
+    )
+    bend: bpy.props.FloatProperty(
+        name="Bend", default=0.0, min=-180.0, max=180.0, step=100, precision=1,
+        description="How far the first piece turns, in degrees. 0 is straight; positive turns left"
+    )
+    elevation: bpy.props.FloatProperty(
+        name="Elevation", default=0.0, min=-100.0, max=200.0, unit='LENGTH',
+        description="Height of the road above the 3D cursor. Left unset, each preset picks its own"
+    )
+
+    PRESET_ELEVATION = {'HIGHWAY': 3.5, 'CABLE_BRIDGE': 12.0, 'OVERPASS': 10.0}
 
     def execute(self, context):
         if context.mode != 'OBJECT':
             bpy.ops.object.mode_set(mode='OBJECT')
 
         active_obj = context.active_object
-        if active_obj and active_obj.type == 'CURVE':
+        use_segments = not (active_obj and active_obj.type == 'CURVE')
+        if not use_segments:
             curve_obj = active_obj
         else:
-            if self.preset_type in ('OVERPASS', 'CABLE_BRIDGE'):
-                pts = [(-50, 0, 0), (-18, 12, 10.0), (18, -12, 10.0), (50, 0, 0)]
-            elif self.preset_type == 'TUNNEL':
-                pts = [(-50, 0, 0), (0, 6, 0), (50, 0, 0)]
-            else:
-                pts = [(-45, 0, 3.5), (0, 15, 5.0), (45, 0, 3.5)]
-            curve_obj = create_guide_curve(context, self.preset_type.title(), pts)
+            if not self.properties.is_property_set("elevation"):
+                self.elevation = self.PRESET_ELEVATION.get(self.preset_type, 0.0)
+            # The road starts at the 3D cursor heading +X; the segment chain gives its shape.
+            curve_obj = create_guide_curve(context, self.preset_type.title(), [(0, 0, 0), (1, 0, 0)])
+            curve_obj.location = context.scene.cursor.location + Vector((0.0, 0.0, self.elevation))
 
         mesh_data = bpy.data.meshes.new(f"Civil_{self.preset_type.title()}_Mesh")
         road_obj = bpy.data.objects.new(f"Civil_{self.preset_type.title()}", mesh_data)
@@ -1451,6 +1620,11 @@ class CIVIL_OT_CreateRoadPreset(bpy.types.Operator):
         # is_civil_object is switched on last so each assignment below doesn't trigger a full rebuild.
         p = road_obj.civil_props
         p.target_curve = curve_obj
+        if use_segments:
+            seg = p.segments.add()
+            seg.length = self.length
+            seg.bend = self.bend
+            p.use_segments = True
 
         if self.preset_type == 'STREET':
             p.lanes_left = 1
@@ -1536,6 +1710,8 @@ class CIVIL_OT_CreateRoadPreset(bpy.types.Operator):
             p.is_overpass = False
 
         p.is_civil_object = True
+        if use_segments:
+            write_segments_to_curve(curve_obj, p.segments)
         dg = context.evaluated_depsgraph_get()
         rebuild_civil_mesh(road_obj, depsgraph=dg)
 
@@ -1546,10 +1722,91 @@ class CIVIL_OT_CreateRoadPreset(bpy.types.Operator):
         return {'FINISHED'}
 
 
+def active_segment_road(context):
+    obj = context.active_object
+    if obj and obj.type == 'MESH' and obj.civil_props.is_civil_object and obj.civil_props.use_segments:
+        return obj
+    return None
+
+
+class CIVIL_OT_SegmentAdd(bpy.types.Operator):
+    bl_idname = "civil.segment_add"
+    bl_label = "Extend Road"
+    bl_description = "Add a new piece to the end of the road"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    kind: bpy.props.EnumProperty(
+        name="Kind",
+        items=[
+            ('STRAIGHT', "Straight", "Add a straight"),
+            ('LEFT', "Curve Left", "Add a curve turning left"),
+            ('RIGHT', "Curve Right", "Add a curve turning right"),
+        ],
+        default='STRAIGHT'
+    )
+    length: bpy.props.FloatProperty(name="Length", default=60.0, min=1.0, max=2000.0, unit='LENGTH')
+    bend: bpy.props.FloatProperty(name="Bend", default=45.0, min=0.0, max=180.0, step=100, precision=1,
+                                  description="Turn angle for a curve, in degrees")
+    rise: bpy.props.FloatProperty(name="Rise", default=0.0, min=-100.0, max=100.0, unit='LENGTH')
+
+    @classmethod
+    def poll(cls, context):
+        return active_segment_road(context) is not None
+
+    def execute(self, context):
+        obj = active_segment_road(context)
+        p = obj.civil_props
+        p.is_civil_object = False  # hold rebuilds while the new segment is filled in
+        try:
+            seg = p.segments.add()
+            seg.length = self.length
+            seg.bend = 0.0 if self.kind == 'STRAIGHT' else (self.bend if self.kind == 'LEFT' else -self.bend)
+            seg.rise = self.rise
+            p.active_segment = len(p.segments) - 1
+        finally:
+            p.is_civil_object = True
+        regenerate_from_segments(obj, context)
+        return {'FINISHED'}
+
+
+class CIVIL_OT_SegmentRemove(bpy.types.Operator):
+    bl_idname = "civil.segment_remove"
+    bl_label = "Remove Segment"
+    bl_description = "Remove the selected piece of road"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        obj = active_segment_road(context)
+        return obj is not None and len(obj.civil_props.segments) > 1
+
+    def execute(self, context):
+        obj = active_segment_road(context)
+        p = obj.civil_props
+        idx = min(p.active_segment, len(p.segments) - 1)
+        p.segments.remove(idx)
+        p.active_segment = max(0, min(idx, len(p.segments) - 1))
+        regenerate_from_segments(obj, context)
+        return {'FINISHED'}
+
+
+class CIVIL_UL_Segments(bpy.types.UIList):
+    def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index):
+        row = layout.row(align=True)
+        if abs(item.bend) < 0.05:
+            seg_icon, kind = 'REMOVE', "Straight"
+        else:
+            seg_icon = 'LOOP_BACK' if item.bend > 0 else 'LOOP_FORWARDS'
+            kind = f"{'Left' if item.bend > 0 else 'Right'} {abs(item.bend):.0f}°"
+        row.label(text=f"{index + 1}. {kind}", icon=seg_icon)
+        row.label(text=f"{item.length:.0f} m")
+
+
 class CIVIL_OT_CreateInterchangeRamp(bpy.types.Operator):
     bl_idname = "civil.create_interchange_ramp"
     bl_label = "Connect Roads with Ramp"
-    bl_description = "Select two Civil Roads (or two Curves) to generate a smooth banked connecting interchange slip-ramp"
+    bl_description = ("Select two Civil Roads (or two Curves) to join their nearest ends with a smooth banked ramp. "
+                      "The ramp leaves the right-hand lane of the other road and enters the active one")
     bl_options = {'REGISTER', 'UNDO'}
 
     def execute(self, context):
@@ -1568,9 +1825,20 @@ class CIVIL_OT_CreateInterchangeRamp(bpy.types.Operator):
         c1 = get_curve(sel[0])
         c2 = get_curve(sel[1])
 
+        if len(sel) > 2:
+            self.report({'WARNING'}, "Select exactly two Civil Roads or Guide Curves.")
+            return {'CANCELLED'}
         if not c1 or not c2 or c1 == c2:
             self.report({'WARNING'}, "Could not find two distinct guide curves from selection.")
             return {'CANCELLED'}
+
+        # The active object is the destination; the other selected one is where the ramp leaves.
+        active = context.active_object
+        src_obj, dst_obj = sel[0], sel[1]
+        if active is not None and active in (sel[0], sel[1]):
+            dst_obj = active
+            src_obj = sel[1] if active is sel[0] else sel[0]
+        c1, c2 = get_curve(src_obj), get_curve(dst_obj)
 
         dg = context.evaluated_depsgraph_get()
         s1 = sample_bezier_curve(c1, 2.0, depsgraph=dg)
@@ -1578,10 +1846,40 @@ class CIVIL_OT_CreateInterchangeRamp(bpy.types.Operator):
         if not s1 or not s2:
             return {'CANCELLED'}
 
-        start_pos, start_tan, _, _ = s1[len(s1) // 2]
-        end_pos, end_tan, _, _ = s2[len(s2) // 2]
+        # Join the closest pair of road ends: leave road 1 through one of its ends and
+        # enter road 2 through one of its ends, travelling with the roads' direction.
+        best = None
+        for i1, out_sign in ((0, -1.0), (len(s1) - 1, 1.0)):
+            for i2, in_sign in ((0, 1.0), (len(s2) - 1, -1.0)):
+                d = (s2[i2][0] - s1[i1][0]).length
+                if best is None or d < best[0]:
+                    best = (d, i1, out_sign, i2, in_sign)
+        _, i1, out_sign, i2, in_sign = best
+
+        def right_lane_offset(o, sample, travel_sign):
+            """World offset from the centreline to the outermost lane on the right of travel."""
+            if o.type != 'MESH' or not o.civil_props.is_civil_object:
+                return Vector((0.0, 0.0, 0.0))
+            p = o.civil_props
+            med = p.median_width if (p.lanes_left > 0 and p.lanes_right > 0) else 0.0
+            hw = ((p.lanes_left + p.lanes_right) * p.lane_width + med + p.shoulder_width * 2.0) * 0.5
+            # Travelling along the curve, the right-hand lanes are the curve's right lanes;
+            # travelling against it, they are the curve's left lanes.
+            lanes = p.lanes_right if travel_sign > 0 else p.lanes_left
+            if lanes <= 0:
+                return Vector((0.0, 0.0, 0.0))
+            x = hw - p.shoulder_width - p.lane_width * 0.5
+            return sample[3] * (x * travel_sign)
+
+        start_pos = s1[i1][0] + right_lane_offset(src_obj, s1[i1], out_sign)
+        start_tan = s1[i1][1] * out_sign
+        end_pos = s2[i2][0] + right_lane_offset(dst_obj, s2[i2], in_sign)
+        end_tan = s2[i2][1] * in_sign
 
         dist = (end_pos - start_pos).length
+        if dist < 1.0:
+            self.report({'WARNING'}, "The selected roads' ends already touch; nothing to connect.")
+            return {'CANCELLED'}
         handle_len = max(8.0, dist * 0.35)
 
         curve_data = bpy.data.curves.new(name="Interchange_Ramp_Curve", type='CURVE')
@@ -1719,6 +2017,33 @@ class CIVIL_PT_MainPanel(bpy.types.Panel):
             p_box.prop(props, "target_curve")
             p_box.operator("civil.select_guide_curve", icon='CURVE_BEZCURVE')
             p_box.prop(props, "resolution_step")
+
+            # Road shape: chain of straights and curves
+            r_box = layout.box()
+            r_box.label(text="Road Shape", icon='CURVE_PATH')
+            if len(props.segments):
+                r_box.prop(props, "use_segments")
+            if props.use_segments and len(props.segments):
+                row = r_box.row()
+                row.template_list("CIVIL_UL_Segments", "", props, "segments", props, "active_segment", rows=3)
+                col = row.column(align=True)
+                col.operator("civil.segment_remove", icon='REMOVE', text="")
+                idx = min(props.active_segment, len(props.segments) - 1)
+                seg = props.segments[idx]
+                col = r_box.column(align=True)
+                col.prop(seg, "length")
+                col.prop(seg, "bend", slider=True)
+                col.prop(seg, "rise")
+                r_box.label(text="Extend Road:")
+                row = r_box.row(align=True)
+                op = row.operator("civil.segment_add", text="Left", icon='LOOP_BACK')
+                op.kind = 'LEFT'
+                op = row.operator("civil.segment_add", text="Straight", icon='REMOVE')
+                op.kind = 'STRAIGHT'
+                op = row.operator("civil.segment_add", text="Right", icon='LOOP_FORWARDS')
+                op.kind = 'RIGHT'
+            elif not len(props.segments):
+                r_box.label(text="Shaped by hand on its guide curve", icon='INFO')
 
             # Banking & Superelevation
             t_box = layout.box()
@@ -1873,8 +2198,12 @@ def civil_depsgraph_update_handler(scene, depsgraph):
         _is_rebuilding = False
 
 classes = (
+    CIVIL_PG_Segment,
     CIVIL_PG_ObjectProps,
     CIVIL_OT_CreateRoadPreset,
+    CIVIL_OT_SegmentAdd,
+    CIVIL_OT_SegmentRemove,
+    CIVIL_UL_Segments,
     CIVIL_OT_CreateInterchangeRamp,
     CIVIL_OT_RefreshAll,
     CIVIL_OT_SelectGuideCurve,
