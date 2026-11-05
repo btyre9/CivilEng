@@ -96,11 +96,17 @@ def main():
     forest = F.find_forest(ter)
     p = plants(forest)
     west = count_in(p, -300, -5, -200, 200)
-    east_trees = sum(int((arr[:, 0] > 5).sum()) for k, arr in p.items() if k != "TF Shrub")
-    in_pond = count_in(p, 85, 155, -35, 35)
+    east_trees = sum(int((arr[:, 0] > 5).sum()) for k, arr in p.items() if k not in ("TF Shrub", "TF Grass"))
+    in_pond = sum(int((np.hypot(arr[:, 0] - 120, arr[:, 1]) < 33).sum()) for arr in p.values())
     ok = forest is not None and west > 500 and east_trees == 0 and in_pond == 0 and {"TF Pine", "TF Leafy", "TF Shrub"} <= set(p)
     report("GROW", ok, f"{sum(len(a) for a in p.values())} plants {{{', '.join(f'{k}: {len(a)}' for k, a in p.items())}}}; "
            f"trees on the grass side {east_trees}, in the pond {in_pond}")
+    g = p.get("TF Grass", np.zeros((0, 3)))
+    g_west = int((g[:, 0] < -5).sum())
+    # tf_grass 0.8 on the east half (300 x 400 m, less the pond) at 4000 per hectare, viewport share
+    expect = 0.8 * 4000 * (300 * 400 - math.pi * 40 ** 2) / 10000 * forest.terraflora.viewport_amount
+    report("GRASS", len(g) > 0.6 * expect and g_west == 0,
+           f"{len(g)} tufts on the grass side (about {expect:.0f} expected), {g_west} in the forest")
 
     # Paint: remove trees from a square in the forest, add pines to a patch of grass.
     pos = np.array([tuple(v.co) for v in ter.data.vertices])
@@ -163,6 +169,29 @@ def main():
     behind = count_in(p, -300, -60, -200, 200)
     report("CULLING", behind == 0, f"plants behind the camera with culling on: {behind}")
     forest.terraflora.camera_culling = False
+
+    # Level of detail: cards beyond Card Distance, full models within it, grass only nearby.
+    fp = forest.terraflora
+    fp.card_distance, fp.grass_distance = 150.0, 100.0
+    p = plants(forest)
+    cam_xyz = np.array(cam.location)
+    def dists(kind):
+        a = p.get(kind, np.zeros((0, 3)))
+        return np.linalg.norm(a - cam_xyz, axis=1)
+    full = np.concatenate([dists(k) for k in ("TF Pine", "TF Leafy", "TF Shrub")])
+    card = np.concatenate([dists(k) for k in ("TF Card Pine", "TF Card Leafy", "TF Card Shrub")])
+    grass = dists("TF Grass")
+    img = bpy.data.images.get("TF Pine 1 Card")
+    alpha = np.array(img.pixels[:]).reshape(-1, 4)[:, 3] if img else np.zeros(1)
+    ok = (len(card) > 100 and len(full) > 50 and card.min() > 149.0 and full.max() < 151.0
+          and len(grass) > 0 and grass.max() < 101.0 and 0.05 < alpha.mean() < 0.8)
+    report("CARDS", ok, f"{len(full)} full plants (max {full.max() if len(full) else 0:.0f} m), {len(card)} cards "
+           f"(min {card.min() if len(card) else 0:.0f} m), grass to {grass.max() if len(grass) else 0:.0f} m; "
+           f"pine card {alpha.mean() * 100:.0f}% covered")
+    fp.use_cards = False
+    p = plants(forest)
+    report("NO CARDS", not any(k.startswith("TF Card") for k in p), f"kinds with cards off: {sorted(p)}")
+    fp.use_cards = True
 
     # Panel draws for the terrain and the forest.
     problems = []

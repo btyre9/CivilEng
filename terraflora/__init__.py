@@ -4,14 +4,15 @@ TerraFlora: forests, shrubs and clearings grown from real aerial photos.
 
 Works on terrains made by CivilFlow (Real-World Terrain): reads where the trees, grass and water
 are from the photo's colour and infrared bands plus USGS land cover, then grows low-poly pines,
-leafy trees and shrubs there with Geometry Nodes instancing. Paint to remove or add plants;
+leafy trees, shrubs and grass tufts there with Geometry Nodes instancing; far from the camera,
+trees turn into cards (pictures of themselves). Paint to remove or add plants;
 CivilFlow roads clear their own space automatically.
 """
 
 bl_info = {
     "name": "TerraFlora: Forests from Aerial Photos",
     "author": "AI Assistant",
-    "version": (0, 1, 0),
+    "version": (0, 2, 0),
     "blender": (5, 1, 0),
     "location": "View3D > Sidebar > TerraFlora",
     "description": "Grows trees and shrubs where the aerial photo shows them, with paintable clearings.",
@@ -41,6 +42,22 @@ class TF_PG_Forest(bpy.types.PropertyGroup):
                                           description="Leafy trees per hectare where the forest is full")
     shrubs_per_ha: bpy.props.FloatProperty(name="Shrubs", default=250.0, min=0.0, max=5000.0, update=_sync,
                                            description="Shrubs per hectare where they grow fully")
+    grass: bpy.props.BoolProperty(name="Grass Tufts", default=True, update=_sync,
+                                  description="Grow grass tufts where the photo shows grass")
+    grass_per_ha: bpy.props.FloatProperty(name="Grass", default=4000.0, min=0.0, max=12000.0, update=_sync,
+                                          description="Grass tufts per hectare in full grass")
+    grass_distance: bpy.props.FloatProperty(
+        name="Grass Distance", default=200.0, min=1.0, max=50000.0, unit='LENGTH', update=_sync,
+        description="Grass grows only this close to the camera (everywhere when there's no camera)")
+    use_cards: bpy.props.BoolProperty(
+        name="Distant Trees as Cards", default=True, update=_sync,
+        description="Draw trees far from the camera as cards: pictures of the tree, 6 triangles instead of hundreds")
+    card_distance: bpy.props.FloatProperty(name="Card Distance", default=300.0, min=0.0, max=50000.0,
+                                           unit='LENGTH', update=_sync,
+                                           description="Trees farther than this from the camera are cards")
+    viewport_cards: bpy.props.BoolProperty(
+        name="All Cards in Viewport", default=False, update=_sync,
+        description="Show every tree as a card while you work, for a fast viewport; renders still use the camera distance")
     road_clearance: bpy.props.FloatProperty(name="Road Clearance", default=3.0, min=0.0, max=100.0, unit='LENGTH',
                                             update=_sync, description="Distance kept clear around CivilFlow roads")
     seed: bpy.props.IntProperty(name="Seed", default=0, min=0, update=_sync,
@@ -52,7 +69,7 @@ class TF_PG_Forest(bpy.types.PropertyGroup):
                                            description="Grow only plants inside the camera's view, for big areas")
     camera: bpy.props.PointerProperty(type=bpy.types.Object, name="Camera", update=_sync,
                                       poll=lambda self, ob: ob.type == 'CAMERA',
-                                      description="Camera to cull for (the scene camera when empty)")
+                                      description="Camera that distances are measured from (the scene camera when empty)")
     view_distance: bpy.props.FloatProperty(name="View Distance", default=1500.0, min=10.0, max=50000.0,
                                            unit='LENGTH', update=_sync)
     view_angle: bpy.props.FloatProperty(name="View Angle", default=110.0, min=10.0, max=180.0, update=_sync,
@@ -258,14 +275,34 @@ class TF_PT_Main(bpy.types.Panel):
             col.prop(p, "pines_per_ha")
             col.prop(p, "leafy_per_ha")
             col.prop(p, "shrubs_per_ha")
+            row = col.row(align=True)
+            row.prop(p, "grass", text="")
+            sub = row.row(align=True)
+            sub.enabled = p.grass
+            sub.prop(p, "grass_per_ha")
             col = box.column(align=True)
             col.prop(p, "road_clearance")
             col.prop(p, "seed")
             col.prop(p, "viewport_amount")
+
+            cam = p.camera or context.scene.camera
+            col = box.column(align=True)
+            col.label(text="Distance from %s:" % (cam.name if cam else "camera"), icon='CAMERA_DATA')
+            if cam is None:
+                col.label(text="No camera: full detail and grass everywhere", icon='INFO')
+            row = col.row(align=True)
+            row.prop(p, "use_cards", text="")
+            sub = row.row(align=True)
+            sub.enabled = p.use_cards
+            sub.prop(p, "card_distance", text="Cards Beyond")
+            sub = col.row(align=True)
+            sub.enabled = p.grass
+            sub.prop(p, "grass_distance", text="Grass Within")
+            col.prop(p, "viewport_cards")
             box.prop(p, "camera_culling")
+            col = box.column(align=True)
+            col.prop(p, "camera")
             if p.camera_culling:
-                col = box.column(align=True)
-                col.prop(p, "camera")
                 col.prop(p, "view_distance")
                 col.prop(p, "view_angle")
 

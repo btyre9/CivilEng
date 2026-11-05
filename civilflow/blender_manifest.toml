@@ -1,7 +1,7 @@
 schema_version = "1.0.0"
 
 id = "civilflow"
-version = "1.10.0"
+version = "1.11.0"
 name = "CivilFlow: Road, Highway & Overpass Generator"
 tagline = "Roads, bridges and traffic on real USGS terrain"
 maintainer = "AI Assistant"

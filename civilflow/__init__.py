@@ -1,7 +1,7 @@
 bl_info = {
     "name": "CivilFlow: Road, Highway & Overpass Generator",
     "author": "AI Assistant",
-    "version": (1, 10, 0),
+    "version": (1, 11, 0),
     "blender": (5, 1, 0),
     "location": "View3D > Sidebar (N) > CivilEng",
     "description": "Procedural roads built from straights and curves, highways, banking, guardrails, gantry signs, tunnels, embankments, cable-stayed towers, toll plazas, animated low-poly traffic, and real USGS terrain with automatic bridges, tunnels and earthworks.",
@@ -17,6 +17,7 @@ import numpy as np
 
 from . import traffic
 from . import terrain
+from . import water
 
 # ==============================================================================
 # 1. PROCEDURAL MATERIALS HELPER (BLENDER 5.x API)
@@ -1187,7 +1188,8 @@ def rebuild_civil_mesh(obj, depsgraph=None, carve=True):
             low_edge = np.minimum(lft[:, 2], rgt[:, 2])
             overrides = [(st.kind, st.center - st.length * 0.5, st.center + st.length * 0.5)
                          for st in props.structures]
-            modes = terrain.classify(d_along, np.minimum(cen[:, 2], low_edge), gc, props, manual, overrides)
+            wet = ~np.isnan(terrain.local_water(obj, ground, cen))
+            modes = terrain.classify(d_along, np.minimum(cen[:, 2], low_edge), gc, props, manual, overrides, wet)
             # Tunnel stretches with too little ground over them sit in an open cut instead.
             crown = cen[:, 2] + props.tunnel_height + props.tunnel_wall_thickness + 1.5
             covered = (modes == terrain.TUNNEL) & (gc >= crown)
@@ -3308,7 +3310,7 @@ classes = (
 )
 
 def register():
-    for cls in classes + traffic.classes + terrain.classes:
+    for cls in classes + traffic.classes + terrain.classes + water.classes:
         bpy.utils.register_class(cls)
     bpy.types.Object.civil_props = bpy.props.PointerProperty(type=CIVIL_PG_ObjectProps)
     bpy.types.Scene.civil_terrain = bpy.props.PointerProperty(type=terrain.CIVIL_PG_TerrainSettings)
@@ -3320,7 +3322,7 @@ def unregister():
         bpy.app.handlers.depsgraph_update_post.remove(civil_depsgraph_update_handler)
     del bpy.types.Scene.civil_terrain
     del bpy.types.Object.civil_props
-    for cls in reversed(classes + traffic.classes + terrain.classes):
+    for cls in reversed(classes + traffic.classes + terrain.classes + water.classes):
         bpy.utils.unregister_class(cls)
 
 if __name__ == "__main__":

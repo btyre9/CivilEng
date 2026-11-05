@@ -6,11 +6,14 @@ Per layer (pines, leafy trees, shrubs) the density at each spot is
 
     clamp(auto * (1 - painted removal) + painted addition) * (1 - water)
 
-where 'auto' is the land cover read from the photo (tf_pines / tf_leafy / tf_shrubs) and the
-painted layers are vertex groups you paint in Weight Paint. Plants are spaced with Poisson-disk
-sampling, kept clear of roads (anything in the TerraFlora Clearing collection, measured on the
-map so bridges and banks clear too), optionally culled to what the camera sees, and placed as
-instances (shared meshes), so even 100,000 trees stay light.
+where 'auto' is the land cover read from the photo (tf_pines / tf_leafy / tf_shrubs / tf_grass)
+and the painted layers are vertex groups you paint in Weight Paint. Plants are spaced with
+Poisson-disk sampling, kept clear of roads (anything in the TerraFlora Clearing collection,
+measured on the map so bridges and banks clear too), optionally culled to what the camera sees,
+and placed as instances (shared meshes), so even 100,000 trees stay light.
+
+Level of detail: trees and shrubs farther than Card Distance from the camera are drawn as cards
+(pictures of the same model, 6 triangles); grass tufts only grow within Grass Distance of it.
 """
 
 import bpy
@@ -18,7 +21,7 @@ import bpy
 from . import assets
 
 NODE_GROUP = "TF_Forest"
-NODE_VERSION = 2
+NODE_VERSION = 3
 CLEARING = "TerraFlora Clearing"
 MOD_NAME = "TerraFlora"
 
@@ -27,7 +30,10 @@ PAINT_LAYERS = {
     'PINES': ("TF Add Pines", "Add Pines", "Plant pines where you paint", 'OUTLINER_OB_FORCE_FIELD'),
     'LEAFY': ("TF Add Leafy Trees", "Add Leafy Trees", "Plant leafy trees where you paint", 'OUTLINER_OB_POINTCLOUD'),
     'SHRUBS': ("TF Add Shrubs", "Add Shrubs", "Plant shrubs where you paint", 'SEQ_HISTOGRAM'),
+    'GRASS': ("TF Add Grass", "Add Grass", "Grow grass tufts where you paint", 'STROKE'),
+    'NO_GRASS': ("TF Remove Grass", "Remove Grass", "Clear grass tufts where you paint", 'PANEL_CLOSE'),
 }
+GRASS_CLEARANCE = 0.6   # grass grows right up to the road shoulder
 
 INPUTS = [
     # name, socket type, default, min, max, description
@@ -36,9 +42,14 @@ INPUTS = [
     ("Pines", 'NodeSocketCollection', None, None, None, ""),
     ("Leafy Trees", 'NodeSocketCollection', None, None, None, ""),
     ("Shrubs", 'NodeSocketCollection', None, None, None, ""),
+    ("Grass", 'NodeSocketCollection', None, None, None, ""),
+    ("Pine Cards", 'NodeSocketCollection', None, None, None, ""),
+    ("Leafy Cards", 'NodeSocketCollection', None, None, None, ""),
+    ("Shrub Cards", 'NodeSocketCollection', None, None, None, ""),
     ("Pines per Hectare", 'NodeSocketFloat', 300.0, 0.0, 3000.0, "Pines in full forest, per 10,000 m²"),
     ("Leafy Trees per Hectare", 'NodeSocketFloat', 260.0, 0.0, 3000.0, "Leafy trees in full forest, per 10,000 m²"),
     ("Shrubs per Hectare", 'NodeSocketFloat', 250.0, 0.0, 5000.0, "Shrubs where they grow fully, per 10,000 m²"),
+    ("Grass per Hectare", 'NodeSocketFloat', 4000.0, 0.0, 12000.0, "Grass tufts in full grass, per 10,000 m²"),
     ("Road Clearance", 'NodeSocketFloat', 3.0, 0.0, 100.0, "Distance kept clear around roads"),
     ("Seed", 'NodeSocketInt', 0, 0, 100000, "Change for a different random layout"),
     ("Viewport Amount", 'NodeSocketFloat', 0.35, 0.0, 1.0, "Share of the plants shown in the viewport (renders show all)"),
@@ -46,6 +57,11 @@ INPUTS = [
     ("Camera Culling", 'NodeSocketBool', False, None, None, "Only grow what the camera can see"),
     ("View Distance", 'NodeSocketFloat', 1500.0, 10.0, 50000.0, "Furthest distance grown when culling"),
     ("View Angle", 'NodeSocketFloat', 110.0, 10.0, 180.0, "Width of the cone kept around the camera's view, in degrees"),
+    ("Has Camera", 'NodeSocketBool', False, None, None, "A camera is set, so distances can be measured"),
+    ("Use Cards", 'NodeSocketBool', True, None, None, "Draw distant trees as cards"),
+    ("Card Distance", 'NodeSocketFloat', 300.0, 0.0, 50000.0, "Trees farther than this from the camera are cards"),
+    ("Viewport Cards", 'NodeSocketBool', False, None, None, "Every tree is a card in the viewport"),
+    ("Grass Distance", 'NodeSocketFloat', 200.0, 1.0, 50000.0, "Grass grows only this close to the camera"),
 ]
 
 
@@ -168,23 +184,29 @@ def build_node_group():
     half_angle = b.math('MULTIPLY', b.math('RADIANS', I["View Angle"], x=-1700, y=-950), 0.5, -1500, -950)
     cos_half = b.math('COSINE', half_angle, x=-1300, y=-950)
 
-    rem = b.attr("TF Remove Trees", -1500, 900)
     water = b.attr("tf_water", -1500, 750)
     dry = b.math('SUBTRACT', 1.0, water, -1300, 750)
-    keep_auto = b.math('SUBTRACT', 1.0, rem, -1300, 900)
+    rem_trees = b.math('SUBTRACT', 1.0, b.attr("TF Remove Trees", -1500, 900), -1300, 900)
+    rem_grass = b.math('SUBTRACT', 1.0, b.attr("TF Remove Grass", -1500, 1050), -1300, 1050)
+    grass_on = b.compare('GREATER_THAN', I["Grass per Hectare"], 0.0, -1300, 1200)
+    # Cards: by distance from the camera, or everywhere in the viewport if asked.
+    cards_by_dist = b.boolean('AND', I["Use Cards"], I["Has Camera"], -1300, 1350)
+    cards_vp = b.boolean('AND', I["Viewport Cards"], isvp.outputs[0], -1300, 1500)
 
     layers = (
-        ("tf_pines", "TF Add Pines", "Pines per Hectare", "Pines", 4.5, 0),
-        ("tf_leafy", "TF Add Leafy Trees", "Leafy Trees per Hectare", "Leafy Trees", 4.5, 100),
-        ("tf_shrubs", "TF Add Shrubs", "Shrubs per Hectare", "Shrubs", 2.0, 200),
+        # land cover, painted add, kept share, per ha, models, cards, spacing, seed, clearance
+        ("tf_pines", "TF Add Pines", rem_trees, "Pines per Hectare", "Pines", "Pine Cards", 4.5, 0, None),
+        ("tf_leafy", "TF Add Leafy Trees", rem_trees, "Leafy Trees per Hectare", "Leafy Trees", "Leafy Cards", 4.5, 100, None),
+        ("tf_shrubs", "TF Add Shrubs", rem_trees, "Shrubs per Hectare", "Shrubs", "Shrub Cards", 2.0, 200, None),
+        ("tf_grass", "TF Add Grass", rem_grass, "Grass per Hectare", "Grass", None, 0.5, 300, GRASS_CLEARANCE),
     )
-    join = b.node('GeometryNodeJoinGeometry', 1400, 0)
-    for k, (auto_name, add_name, per_ha, coll, spacing, seed_off) in enumerate(layers):
-        y = 1300 - k * 900
+    join = b.node('GeometryNodeJoinGeometry', 3400, 0)
+    for k, (auto_name, add_name, keep, per_ha, coll, cards, spacing, seed_off, clearance) in enumerate(layers):
+        y = 2600 - k * 1300
         x = -1100
         auto = b.attr(auto_name, x, y)
         add = b.attr(add_name, x, y - 150)
-        d = b.math('MULTIPLY', auto, keep_auto, x + 200, y)
+        d = b.math('MULTIPLY', auto, keep, x + 200, y)
         d = b.math('ADD', d, add, x + 400, y, clamp=True)
         d = b.math('MULTIPLY', d, dry, x + 600, y)
         dmax = b.math('MULTIPLY', b.math('DIVIDE', I[per_ha], 10000.0, x + 200, y - 300), vp_amount, x + 400, y - 300)
@@ -197,6 +219,12 @@ def build_node_group():
         b.put(dist.inputs["Density Factor"], d)
         b.put(dist.inputs["Seed"], seed)
         pts = dist.outputs["Points"]
+        if coll == "Grass":
+            # Grass is skipped entirely when its density is 0 (no work at all).
+            sw = b.node('GeometryNodeSwitch', x + 1000, y + 150, input_type='GEOMETRY')
+            b.put(sw.inputs["Switch"], grass_on)
+            b.put(sw.inputs["True"], pts)
+            pts = sw.outputs[0]
 
         # Keep off roads.
         ppos = b.node('GeometryNodeInputPosition', x + 800, y - 300)
@@ -204,14 +232,15 @@ def build_node_group():
         prox = b.node('GeometryNodeProximity', x + 1200, y - 250, target_element='FACES')
         b.put(prox.inputs["Geometry"], clear_geo)
         b.put(prox.inputs["Sample Position"], pflat)
-        near = b.compare('LESS_THAN', prox.outputs["Distance"], I["Road Clearance"], x + 1400, y - 250)
+        near = b.compare('LESS_THAN', prox.outputs["Distance"],
+                         clearance if clearance is not None else I["Road Clearance"], x + 1400, y - 250)
         near = b.boolean('AND', near, has_clear, x + 1600, y - 250)
         dele = b.node('GeometryNodeDeleteGeometry', x + 1800, y, domain='POINT')
         b.put(dele.inputs["Geometry"], pts)
         b.put(dele.inputs["Selection"], near)
         pts = dele.outputs[0]
 
-        # Camera culling.
+        # Camera culling (and, for grass, only near the camera).
         rel = b.vmath('SUBTRACT', ppos.outputs[0], cam.outputs["Location"], x + 1000, y - 550)
         length = b.vmath('LENGTH', rel, x=x + 1200, y=y - 500, out=1)
         dirn = b.vmath('NORMALIZE', rel, x=x + 1200, y=y - 650)
@@ -220,45 +249,66 @@ def build_node_group():
         in_range = b.compare('LESS_THAN', length, I["View Distance"], x + 1600, y - 500)
         visible = b.boolean('AND', in_cone, in_range, x + 1800, y - 550)
         hide = b.boolean('NIMPLY', I["Camera Culling"], visible, x + 2000, y - 550)
+        if coll == "Grass":
+            too_far = b.compare('GREATER_THAN', length, I["Grass Distance"], x + 1800, y - 800)
+            too_far = b.boolean('AND', too_far, I["Has Camera"], x + 2000, y - 800)
+            hide = b.boolean('OR', hide, too_far, x + 2200, y - 650)
         cull = b.node('GeometryNodeDeleteGeometry', x + 2000, y, domain='POINT')
         b.put(cull.inputs["Geometry"], pts)
         b.put(cull.inputs["Selection"], hide)
         pts = cull.outputs[0]
 
-        # Plants: a random one of the layer's models, turned and sized at random.
-        cinst = b.node('GeometryNodeCollectionInfo', x + 2000, y + 300, transform_space='ORIGINAL')
-        b.put(cinst.inputs["Collection"], I[coll])
-        cinst.inputs["Separate Children"].default_value = True
-        cinst.inputs["Reset Children"].default_value = True
-        idx = b.random('INT', 0, 1000, seed_off + 1, x + 2000, y - 200)
-        ang = b.random('FLOAT', 0.0, 6.2832, seed_off + 2, x + 2000, y - 350)
-        sc = b.random('FLOAT', 0.75, 1.3, seed_off + 3, x + 2000, y - 500)
-        e = b.node('ShaderNodeCombineXYZ', x + 2200, y - 350)
-        b.put(e.inputs["Z"], ang)
-        r = b.node('FunctionNodeEulerToRotation', x + 2400, y - 350)
-        b.put(r.inputs[0], e.outputs[0])
-        s3 = b.node('ShaderNodeCombineXYZ', x + 2200, y - 500)
-        for c in ("X", "Y", "Z"):
-            b.put(s3.inputs[c], sc)
-        iop = b.node('GeometryNodeInstanceOnPoints', x + 2600, y)
-        b.put(iop.inputs["Points"], pts)
-        b.put(iop.inputs["Instance"], cinst.outputs[0])
-        iop.inputs["Pick Instance"].default_value = True
-        b.put(iop.inputs["Instance Index"], idx)
-        b.put(iop.inputs["Rotation"], r.outputs[0])
-        b.put(iop.inputs["Scale"], s3.outputs[0])
-        tint = b.random('FLOAT', 0.0, 1.0, seed_off + 4, x + 2600, y - 300)
-        store = b.node('GeometryNodeStoreNamedAttribute', x + 2800, y, data_type='FLOAT', domain='INSTANCE')
-        b.put(store.inputs["Geometry"], iop.outputs[0])
-        store.inputs["Name"].default_value = "tf_tint"
-        b.put(store.inputs["Value"], tint)
-        ng.links.new(store.outputs[0], join.inputs[0])
+        # Each plant's random model, turn, size and shade, kept on the point so the near model and
+        # the far card of the same plant match.
+        for name, dtype, lo, hi, off in (("tf_pick", 'INT', 0, 1000, 1), ("tf_turn", 'FLOAT', 0.0, 6.2832, 2),
+                                         ("tf_size", 'FLOAT', 0.75, 1.3, 3), ("tf_tint", 'FLOAT', 0.0, 1.0, 4)):
+            st = b.node('GeometryNodeStoreNamedAttribute', x + 2200 + off * 150, y, data_type=dtype, domain='POINT')
+            b.put(st.inputs["Geometry"], pts)
+            st.inputs["Name"].default_value = name
+            b.put(st.inputs["Value"], b.random(dtype, lo, hi, seed_off + off, x + 2200 + off * 150, y - 250))
+            pts = st.outputs[0]
+
+        def plant(points, collection, xx, yy):
+            cinst = b.node('GeometryNodeCollectionInfo', xx, yy + 300, transform_space='ORIGINAL')
+            b.put(cinst.inputs["Collection"], I[collection])
+            cinst.inputs["Separate Children"].default_value = True
+            cinst.inputs["Reset Children"].default_value = True
+            pick = b.node('GeometryNodeInputNamedAttribute', xx, yy - 200, data_type='INT')
+            pick.inputs["Name"].default_value = "tf_pick"
+            e = b.node('ShaderNodeCombineXYZ', xx + 200, yy - 350)
+            b.put(e.inputs["Z"], b.attr("tf_turn", xx, yy - 350))
+            r = b.node('FunctionNodeEulerToRotation', xx + 400, yy - 350)
+            b.put(r.inputs[0], e.outputs[0])
+            sc = b.attr("tf_size", xx, yy - 500)
+            s3 = b.node('ShaderNodeCombineXYZ', xx + 200, yy - 500)
+            for c in ("X", "Y", "Z"):
+                b.put(s3.inputs[c], sc)
+            iop = b.node('GeometryNodeInstanceOnPoints', xx + 600, yy)
+            b.put(iop.inputs["Points"], points)
+            b.put(iop.inputs["Instance"], cinst.outputs[0])
+            iop.inputs["Pick Instance"].default_value = True
+            b.put(iop.inputs["Instance Index"], pick.outputs["Attribute"])
+            b.put(iop.inputs["Rotation"], r.outputs[0])
+            b.put(iop.inputs["Scale"], s3.outputs[0])
+            ng.links.new(iop.outputs[0], join.inputs[0])
+
+        if cards is None:
+            plant(pts, coll, x + 3000, y)
+            continue
+        far = b.compare('GREATER_THAN', length, I["Card Distance"], x + 2800, y - 700)
+        far = b.boolean('AND', far, cards_by_dist, x + 3000, y - 700)
+        far = b.boolean('OR', far, cards_vp, x + 3200, y - 700)
+        sep = b.node('GeometryNodeSeparateGeometry', x + 3000, y, domain='POINT')
+        b.put(sep.inputs["Geometry"], pts)
+        b.put(sep.inputs["Selection"], far)
+        plant(sep.outputs["Inverted"], coll, x + 3400, y + 200)
+        plant(sep.outputs["Selection"], cards, x + 3400, y - 500)
     ng.links.new(join.outputs[0], gout.inputs[0])
     return ng
 
 
 def clearing_collection():
-    """Collection of everything trees keep away from: every CivilFlow road, kept up to date."""
+    """Collection of everything plants keep away from: CivilFlow roads and lakes, kept up to date."""
     col = bpy.data.collections.get(CLEARING)
     if col is None:
         col = bpy.data.collections.new(CLEARING)
@@ -271,7 +321,9 @@ def sync_clearing(scene):
         return
     for ob in scene.objects:
         props = getattr(ob, "civil_props", None)
-        if ob.type == 'MESH' and props is not None and props.is_civil_object and ob.name not in col.objects:
+        road = props is not None and props.is_civil_object
+        lake = bool(ob.get("cf_water_of"))  # CivilFlow lakes and ponds
+        if ob.type == 'MESH' and (road or lake) and ob.name not in col.objects:
             col.objects.link(ob)
 
 
@@ -305,9 +357,14 @@ def sync_modifier(forest, scene=None):
         "Pines": cols["PINES"],
         "Leafy Trees": cols["LEAFY_WINTER"] if p.season == 'WINTER' else cols["LEAFY_SUMMER"],
         "Shrubs": cols["SHRUBS"],
+        "Grass": cols["GRASS_WINTER"] if p.season == 'WINTER' else cols["GRASS_SUMMER"],
+        "Pine Cards": cols["PINES_CARDS"],
+        "Leafy Cards": cols["LEAFY_WINTER_CARDS"] if p.season == 'WINTER' else cols["LEAFY_SUMMER_CARDS"],
+        "Shrub Cards": cols["SHRUBS_CARDS"],
         "Pines per Hectare": p.pines_per_ha,
         "Leafy Trees per Hectare": p.leafy_per_ha,
         "Shrubs per Hectare": p.shrubs_per_ha,
+        "Grass per Hectare": p.grass_per_ha if p.grass else 0.0,
         "Road Clearance": p.road_clearance,
         "Seed": p.seed,
         "Viewport Amount": p.viewport_amount,
@@ -315,6 +372,11 @@ def sync_modifier(forest, scene=None):
         "Camera Culling": p.camera_culling and camera is not None,
         "View Distance": p.view_distance,
         "View Angle": p.view_angle,
+        "Has Camera": camera is not None,
+        "Use Cards": p.use_cards,
+        "Card Distance": p.card_distance,
+        "Viewport Cards": p.viewport_cards,
+        "Grass Distance": p.grass_distance,
     }
     for name, value in values.items():
         set_input(mod, socket_id(ng, name), value)

@@ -293,6 +293,60 @@ def terrain_tests(mod, failures):
            f"peak {above.max():.1f} m (asked {rp.terrain_offset:g}), max grade {grade_r:.2f}%")
     bpy.data.objects.remove(ramp)
 
+    # A lake: bed dug under the outline, water on top, and a street across it bridges the water.
+    W = sys.modules["civilflow.water"]
+    lx = np.arange(2700.0, 3300.0 + 1e-6, 4.0)
+    ly = np.arange(-200.0, 200.0 + 1e-6, 4.0)
+    LX, LY = np.meshgrid(lx, ly)
+    inside = np.hypot(LX - 3000.0, LY) < 90.0
+    dem = np.where(inside, 148.0, 150.0 + 0.004 * np.hypot(LX - 3000.0, LY))  # hydro-flattened lake
+    lake_t = T.build_terrain(bpy.context, "Terrain_Lake", 400000.0 + lx, 3800000.0 + ly, dem, 11, True)
+    a = np.linspace(0.0, 2.0 * np.pi, 72, endpoint=False)
+    shore = np.stack([3000.0 + 92.0 * np.cos(a), 92.0 * np.sin(a)], axis=1)
+    isle = np.stack([3030.0 + 12.0 * np.cos(a), 12.0 * np.sin(a)], axis=1)
+    lakes = W.apply_water(bpy.context, lake_t, [("Test Lake", "lake or pond", [shore, isle])])
+    gl = T.ground_for(lake_t)
+    level = 148.0 - z0
+    wl = gl.water_levels([3000.0, 3030.0, 3200.0], [0.0, 0.0, 0.0])
+    bed = gl.world_heights([2960.0], [0.0])[0]
+    wobj = W.water_object(lake_t)
+    ok = (len(lakes) == 1 and abs(lakes[0][3] - level) < 1e-3 and abs(wl[0] - level) < 1e-3
+          and np.isnan(wl[1]) and np.isnan(wl[2]) and abs(bed - (level - W.MAX_DEPTH)) < 0.01
+          and wobj is not None and len(wobj.data.polygons) > 50
+          and all(abs(v.co.z - level - 0.02) < 1e-3 for v in wobj.data.vertices))
+    report("WATER", ok, f"level {wl[0]:.2f} (DEM {level:.2f}), island dry={np.isnan(wl[1])}, bed {level - bed:.1f} m deep, "
+           f"water mesh {len(wobj.data.polygons) if wobj else 0} faces")
+
+    bpy.context.scene.cursor.location = (2760.0, 0.0, 0.0)
+    for o in bpy.context.selected_objects:
+        o.select_set(False)
+    bpy.context.view_layer.objects.active = None
+    bpy.ops.civil.create_road_preset(preset_type='STREET', length=480.0)
+    st = bpy.context.active_object
+    smp_l = mod.road_local_samples(st)
+    PL = np.array([tuple(st.matrix_world @ sp[0]) for sp in smp_l])
+    wet = ~np.isnan(gl.water_levels(PL[:, 0], PL[:, 1]))
+    mode_l = T._CARVE[st.name]["mode"]
+    deck_under = PL[:, 2] - st.civil_props.deck_thickness
+    ok = (st.civil_props.terrain_object == lake_t and wet.any() and bool(np.all(mode_l[wet] == T.BRIDGE))
+          and float(deck_under[wet].min() - level) >= T.WATER_CLEARANCE - 0.05
+          and mode_l[0] == T.ROAD and mode_l[-1] == T.ROAD)
+    report("WATER BRIDGE", ok, f"{int(wet.sum())} samples over water, all bridge={bool(np.all(mode_l[wet] == T.BRIDGE))}, "
+           f"deck {deck_under[wet].min() - level:.1f} m above the water, ends on the ground={mode_l[0] == T.ROAD}")
+
+    W.remove_water(lake_t)
+    bpy.ops.civil.refresh_all()
+    co_l = np.empty(len(lake_t.data.vertices) * 3, dtype=np.float32)
+    lake_t.data.vertices.foreach_get("co", co_l)
+    mode_after = T._CARVE[st.name]["mode"]
+    ok = (W.water_object(lake_t) is None and "cf_water" not in lake_t.data.attributes
+          and abs(T.ground_for(lake_t).world_heights([2960.0], [0.0])[0] - level) < 1e-3
+          and not np.any(mode_after == T.BRIDGE))
+    report("WATER REMOVE", ok, f"lakebed filled back to {T.ground_for(lake_t).world_heights([2960.0], [0.0])[0]:.2f}, "
+           f"water gone={W.water_object(lake_t) is None}, street back on the ground={not np.any(mode_after == T.BRIDGE)}")
+    bpy.data.objects.remove(st)
+    bpy.data.objects.remove(lake_t)
+
     # Photo tiles: each face takes the tile whose core holds it and stays inside that tile's image.
     res, tnx, tny, tx, ty, margin = T.plan_photo(3000.0, 2000.0, 0.3, 4.0)
     ex = np.arange(-1500.0, 1500.0 + 1e-6, 8.0) + 400000.0

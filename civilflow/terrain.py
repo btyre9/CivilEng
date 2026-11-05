@@ -101,6 +101,10 @@ class Ground:
             me.attributes["cf_ground"].data.foreach_get("value", a)
             self.H = a.reshape(ny, nx).astype(np.float64)
             self.grid = (float(x0), float(y0), float(dx), float(dy), nx, ny)
+            self.W = None
+            if "cf_water" in me.attributes:
+                me.attributes["cf_water"].data.foreach_get("value", a)
+                self.W = a.reshape(ny, nx).astype(np.float64)
         else:
             mw = obj.matrix_world
             verts = [mw @ v.co for v in me.vertices]
@@ -137,6 +141,27 @@ class Ground:
              + H[j + 1, i] * (1 - fx) * fy + H[j + 1, i + 1] * fx * fy)
         wz = mw[2, 0] * lx + mw[2, 1] * ly + mw[2, 2] * h + mw[2, 3]
         return np.where(inside, wz, np.nan)
+
+    def water_levels(self, x, y):
+        """World height of the water surface at (x, y); nan on dry land."""
+        x = np.atleast_1d(np.asarray(x, dtype=np.float64))
+        y = np.atleast_1d(np.asarray(y, dtype=np.float64))
+        if self.grid is None or getattr(self, "W", None) is None:
+            return np.full(x.shape, np.nan)
+        mi, mw = self.mi, self.mw
+        lx = mi[0, 0] * x + mi[0, 1] * y + mi[0, 3]
+        ly = mi[1, 0] * x + mi[1, 1] * y + mi[1, 3]
+        x0, y0, dx, dy, nx, ny = self.grid
+        gx = (lx - x0) / dx
+        gy = (ly - y0) / dy
+        inside = (gx >= 0.0) & (gx <= nx - 1) & (gy >= 0.0) & (gy <= ny - 1)
+        i = np.clip(gx, 0.0, nx - 1.000001).astype(np.int64)
+        j = np.clip(gy, 0.0, ny - 1.000001).astype(np.int64)
+        W = self.W
+        # Wet if any corner of the cell is: the shore lies somewhere inside that cell.
+        w = np.maximum(np.maximum(W[j, i], W[j, i + 1]), np.maximum(W[j + 1, i], W[j + 1, i + 1]))
+        wz = mw[2, 0] * lx + mw[2, 1] * ly + mw[2, 2] * w + mw[2, 3]
+        return np.where(inside & (w > -1.0e5), wz, np.nan)
 
 
 _GROUND = {}
@@ -178,6 +203,20 @@ def local_heights(obj, ground, pts):
     W = np.stack([P[:, 0], P[:, 1], wz], axis=1)
     Mi = np.linalg.inv(M)
     return (W @ Mi[:3, :3].T + Mi[:3, 3])[:, 2]
+
+
+def local_water(obj, ground, pts):
+    """Water surface z, in obj's local space, below each of obj's local points; nan over land."""
+    pts = np.asarray(pts, dtype=np.float64).reshape(-1, 3)
+    M = np.array(obj.matrix_world, dtype=np.float64)
+    P = pts @ M[:3, :3].T + M[:3, 3]
+    wz = ground.water_levels(P[:, 0], P[:, 1])
+    W = np.stack([P[:, 0], P[:, 1], np.nan_to_num(wz)], axis=1)
+    Mi = np.linalg.inv(M)
+    return np.where(np.isnan(wz), np.nan, (W @ Mi[:3, :3].T + Mi[:3, 3])[:, 2])
+
+
+WATER_CLEARANCE = 5.0   # roads cross lakes at least this high above the water (to the deck's underside)
 
 
 def fill_along(a, fallback=0.0):
@@ -246,6 +285,17 @@ def drape(road, samples, ground, pin_start_z=None):
         sel = np.abs(d - st.center) <= st.length * 0.5
         need = g + st.clearance + deck
         lift = sel & (need >= z - 0.01)
+        z = np.where(lift, need, z)
+        w = np.where(lift, 1000.0, w)
+    # Over lakes the road climbs to bridge height, unless you asked for an earth bank (a causeway).
+    wl = ground.water_levels(xs, ys)
+    wet = ~np.isnan(wl)
+    for st in p.structures:
+        if st.kind == 'BANK':
+            wet &= np.abs(d - st.center) > st.length * 0.5
+    if wet.any():
+        need = np.where(wet, wl + WATER_CLEARANCE + deck + 0.4, -np.inf)  # smoothing trims the climb a little
+        lift = wet & (need >= z - 0.01)
         z = np.where(lift, need, z)
         w = np.where(lift, 1000.0, w)
     # Ends held in place: on the road this one continues from, or ramped down to the ground.
@@ -359,14 +409,17 @@ def _run_len(d, a, b):
 OVERRIDE_MODE = {'BRIDGE': BRIDGE, 'BANK': ROAD, 'TUNNEL': TUNNEL}
 
 
-def classify(d, surface_z, ground_z, props, manual_tunnel=None, overrides=()):
+def classify(d, surface_z, ground_z, props, manual_tunnel=None, overrides=(), wet=None):
     """
     Per-sample ROAD / BRIDGE / TUNNEL, with short stretches tidied away. overrides are
-    (kind, from, to) distances along the road that you set by hand; they win.
+    (kind, from, to) distances along the road that you set by hand; they win. wet marks samples
+    over water, which automatic bridges always span.
     """
     n = len(d)
     mode = np.full(n, ROAD, dtype=np.int64)
     h = surface_z - ground_z
+    if wet is None:
+        wet = np.zeros(n, dtype=bool)
     if props.is_overpass:
         # An elevated road is a bridge, except where it comes down to the ground (ramped ends).
         mode[h > 2.0] = BRIDGE
@@ -374,14 +427,14 @@ def classify(d, surface_z, ground_z, props, manual_tunnel=None, overrides=()):
             if kind == ROAD and 0 < a and b < n - 1 and _run_len(d, a, b) < 30.0:
                 mode[a:b + 1] = BRIDGE
     elif props.auto_bridges:
-        mode[h > props.bridge_min_height] = BRIDGE
+        mode[(h > props.bridge_min_height) | wet] = BRIDGE
         # Close short dips back to ground between two bridges, then drop stub bridges.
         runs = _runs(mode)
         for k, (kind, a, b) in enumerate(runs):
             if kind == ROAD and 0 < k < len(runs) - 1 and _run_len(d, a, b) < 30.0:
                 mode[a:b + 1] = BRIDGE
         for kind, a, b in _runs(mode):
-            if kind == BRIDGE and _run_len(d, a, b) < 12.0:
+            if kind == BRIDGE and _run_len(d, a, b) < 12.0 and not wet[a:b + 1].any():
                 mode[a:b + 1] = ROAD
     if props.auto_tunnels:
         deep = (-h) > props.tunnel_min_depth
@@ -815,8 +868,8 @@ def _ssl_context():
         return ssl.create_default_context()
 
 
-def fetch(url, params, path, timeout=180):
-    """Downloads one exportImage request to path (kept as a cache for the same area)."""
+def fetch(url, params, path, timeout=180, expect="image"):
+    """Downloads one request to path (kept as a cache for the same area). expect is "image" or "json"."""
     if os.path.exists(path) and os.path.getsize(path) > 0:
         return path
     req = urllib.request.Request(url + "?" + urllib.parse.urlencode(params),
@@ -836,7 +889,10 @@ def fetch(url, params, path, timeout=180):
             if attempt == tries - 1:
                 raise
         time.sleep(min(20.0, 3.0 * 2 ** attempt))  # busy server: wait and try again
-    if "json" in ctype or "html" in ctype or data[:1] in (b"{", b"<"):
+    if expect == "json":
+        if data[:1] != b"{":
+            raise RuntimeError("The USGS server didn't return data: " + data[:300].decode("utf-8", "replace"))
+    elif "json" in ctype or "html" in ctype or data[:1] in (b"{", b"<"):
         msg = data[:300].decode("utf-8", "replace")
         raise RuntimeError("The USGS server didn't return an image: " + msg)
     tmp = path + ".part"
@@ -1065,6 +1121,8 @@ class CIVIL_PG_TerrainSettings(bpy.types.PropertyGroup):
     )
     imagery: bpy.props.BoolProperty(name="Aerial Photo", default=True,
                                     description="Drape a USDA NAIP aerial photo over the terrain")
+    lakes: bpy.props.BoolProperty(name="Lakes", default=True,
+                                  description="Fill mapped lakes, ponds and reservoirs with water (USGS NHD)")
     image_res: bpy.props.FloatProperty(
         name="Photo Detail", default=0.3, min=0.3, max=10.0, unit='LENGTH',
         description="Metres per photo pixel; 0.3 m is NAIP's sharpest. Big areas download in tiles, "
@@ -1122,8 +1180,19 @@ class CIVIL_OT_TerrainDownload(bpy.types.Operator):
             return {'CANCELLED'}
         finally:
             _busy(context, False)
+        note = ""
+        if s.lakes:
+            from . import water
+            try:
+                lakes = water.add_water(context, obj)
+                if lakes:
+                    note = " " + obj.get("cf_water_info", "") + "."
+            except Exception as e:
+                self.report({'WARNING'}, "Terrain ready, but %s. Use Add Lakes and Ponds later" % e)
+                _finish(context, obj)
+                return {'FINISHED'}
         _finish(context, obj)
-        self.report({'INFO'}, "Terrain ready. Draw a curve over it (top view) and pick a road preset.")
+        self.report({'INFO'}, "Terrain ready.%s Draw a curve over it (top view) and pick a road preset." % note)
         return {'FINISHED'}
 
 
@@ -1181,6 +1250,7 @@ class CIVIL_PT_Terrain(bpy.types.Panel):
         sub = row.row(align=True)
         sub.enabled = s.imagery
         sub.prop(s, "image_res", text="Detail")
+        col.prop(s, "lakes", text="Lakes and Ponds")
         verts = (s.width_km * 1000.0 / s.spacing) * (s.height_km * 1000.0 / s.spacing)
         box.label(text="About %.2f million vertices" % (verts / 1e6),
                   icon='ERROR' if verts > MAX_VERTS else 'INFO')
@@ -1206,6 +1276,13 @@ class CIVIL_PT_Terrain(bpy.types.Panel):
             rng = obj.get("cf_elev_range")
             if rng:
                 ibox.label(text="Elevation %.0f to %.0f m" % (rng[0], rng[1]))
+            if "cf_water" in obj.data.attributes:
+                ibox.label(text=str(obj.get("cf_water_info", "Water")), icon='MOD_FLUIDSIM')
+                row = ibox.row(align=True)
+                row.operator("civil.terrain_water", text="Fetch Again", icon='FILE_REFRESH')
+                row.operator("civil.terrain_water_remove", icon='X')
+            else:
+                ibox.operator("civil.terrain_water", icon='MOD_FLUIDSIM')
         cg = cursor_geo(context.scene)
         if cg:
             lat, lon, elev = cg
