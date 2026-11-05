@@ -1,9 +1,9 @@
 schema_version = "1.0.0"
 
 id = "civilflow"
-version = "1.6.0"
+version = "1.7.0"
 name = "CivilFlow: Road, Highway & Overpass Generator"
-tagline = "Procedural roads, bridges, tunnels and toll plazas from curves"
+tagline = "Procedural roads, bridges and tunnels with animated traffic"
 maintainer = "AI Assistant"
 type = "add-on"
 

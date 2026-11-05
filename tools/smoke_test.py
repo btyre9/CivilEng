@@ -174,6 +174,83 @@ def main():
     if render_dir:
         render_preview(road, os.path.join(render_dir, "segments.png"))
 
+    # Traffic: vehicles drive their lanes in the right direction, at the right speed, banked with the road
+    clear_scene()
+    bpy.ops.civil.create_road_preset(preset_type='OVERPASS', length=200.0, bend=60.0)
+    road = bpy.context.active_object
+    road.civil_props.traffic_density = 3.0
+    res = bpy.ops.civil.traffic_generate()
+    col = road.civil_props.traffic_collection
+    cars = [o for o in col.objects if o.get("cf_kind")]
+    scene = bpy.context.scene
+    fps = scene.render.fps / scene.render.fps_base
+    simple = all(o.animation_data.drivers[0].driver.is_simple_expression for o in cars)
+
+    from civilflow import road_local_samples
+    samples = road_local_samples(road, bpy.context.evaluated_depsgraph_get())
+    mw = road.matrix_world
+
+    def nearest(p):
+        return min(samples, key=lambda s: ((mw @ s[0]) - p).length)
+
+    scene.frame_set(1)
+    pos1 = {o.name: o.matrix_world.translation.copy() for o in cars}
+    worst_up = 1.0
+    worst_fwd = 1.0
+    wrong_way = 0
+    for o in cars:
+        s = nearest(pos1[o.name])
+        up = o.matrix_world.to_3x3().col[2].normalized()
+        fwd = o.matrix_world.to_3x3().col[0].normalized()
+        worst_up = min(worst_up, up.dot((mw.to_3x3() @ s[2]).normalized()))
+        along = fwd.dot((mw.to_3x3() @ s[1]).normalized())
+        worst_fwd = min(worst_fwd, abs(along))
+        lane_dir = 1.0 if o.constraints[0].target.get("cf_lane", "").startswith("R") else -1.0
+        if along * lane_dir < 0:
+            wrong_way += 1
+    scene.frame_set(1 + int(fps * 2))
+    speed_err = 0.0
+    moved = 0
+    for o in cars:
+        d = (o.matrix_world.translation - pos1[o.name]).length
+        expect = o["cf_speed"] * 2.0
+        if d < expect * 1.5:  # skip vehicles that wrapped from the end back to the start
+            speed_err = max(speed_err, abs(d - expect) / expect)
+            moved += 1
+    ok = (res == {'FINISHED'} and len(cars) >= 8 and simple and wrong_way == 0 and worst_up > 0.995
+          and worst_fwd > 0.98 and moved > len(cars) // 2 and speed_err < 0.05)
+    kinds = sorted({o["cf_kind"] for o in cars})
+    print(f"[{'OK ' if ok else 'BAD'}] TRAFFIC       {len(cars)} vehicles {kinds}, simple drivers={simple}, "
+          f"wrong-way={wrong_way}, up-vs-road={worst_up:.4f}, heading={worst_fwd:.4f}, "
+          f"speed error={speed_err * 100:.1f}% over {moved} vehicles")
+    if not ok:
+        failures.append("TRAFFIC")
+
+    # Editing the road moves its traffic with it
+    scene.frame_set(1)
+    before = cars[0].matrix_world.translation.copy()
+    road.civil_props.segments[0].bend = -60.0
+    bpy.context.view_layer.update()
+    scene.frame_set(1)
+    after = cars[0].matrix_world.translation.copy()
+    samples = road_local_samples(road, bpy.context.evaluated_depsgraph_get())
+    off_road = min(((mw @ s[0]) - after).length for s in samples)
+    ok = (after - before).length > 1.0 and off_road < road.civil_props.lanes_left * 3.6 + 6
+    print(f"[{'OK ' if ok else 'BAD'}] TRAFFIC EDIT  vehicle moved {(after - before).length:.1f} m with the road, "
+          f"{off_road:.1f} m from centreline")
+    if not ok:
+        failures.append("TRAFFIC EDIT")
+    if render_dir:
+        road.civil_props.segments[0].bend = 60.0
+        scene.frame_set(1)
+        render_preview(road, os.path.join(render_dir, "traffic.png"))
+    bpy.ops.civil.traffic_remove()
+    left = [o for o in bpy.data.objects if o.get("cf_kind") or o.get("cf_lane")]
+    ok = not left and road.civil_props.traffic_collection is None
+    print(f"[{'OK ' if ok else 'BAD'}] TRAFFIC REMOVE {len(left)} leftovers")
+    if not ok:
+        failures.append("TRAFFIC REMOVE")
+
     # Spline tilt lands where the control point really is along the curve
     clear_scene()
     curve = mod.create_guide_curve(bpy.context, "TiltTest", [(0, 0, 0), (10, 0, 0), (100, 0, 0)])

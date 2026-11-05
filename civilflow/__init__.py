@@ -1,10 +1,10 @@
 bl_info = {
     "name": "CivilFlow: Road, Highway & Overpass Generator",
     "author": "AI Assistant",
-    "version": (1, 6, 0),
+    "version": (1, 7, 0),
     "blender": (5, 1, 0),
     "location": "View3D > Sidebar (N) > CivilEng",
-    "description": "Procedural roads built from straights and curves, highways, banking, guardrails, gantry signs, tunnels, embankments, cable-stayed towers, and toll plazas.",
+    "description": "Procedural roads built from straights and curves, highways, banking, guardrails, gantry signs, tunnels, embankments, cable-stayed towers, toll plazas, and animated low-poly traffic.",
     "category": "Add Mesh",
 }
 
@@ -12,6 +12,8 @@ import bpy
 import bmesh
 from mathutils import Vector, Matrix
 import math
+
+from . import traffic
 
 # ==============================================================================
 # 1. PROCEDURAL MATERIALS HELPER (BLENDER 5.x API)
@@ -636,22 +638,52 @@ def add_streetlight_at(bm, base_p, right, tangent, normal, arm_dir, pole_h, arm_
     add_box_prism(bm, head_c - normal * 0.03, right, tangent, normal, 0.32, 0.13, 0.04, mat_index=7)
 
 
-def add_pillar_at(bm, pier_top, right, tangent, width, depth, ground_z, mat_index=1):
-    """Vertical concrete pier from ground_z up to the deck soffit, topped with a wider pier cap."""
-    up = Vector((0.0, 0.0, 1.0))
-    r = Vector((right.x, right.y, 0.0))
-    if r.length < 1e-6:
-        r = Vector((1.0, 0.0, 0.0))
-    r.normalize()
-    t = up.cross(r).normalized()
+def add_pier_bent(bm, pos, right, normal, center_x, soffit_w, deck_t, ground_z, style,
+                  col_width, col_depth, mat_index=1):
+    """
+    One bridge support under the deck: a cap beam that spans the underside of the girder
+    (banked with the deck), carried on vertical columns that stand on spread footings.
 
-    height = pier_top.z - ground_z
-    if height < 0.2:
-        return
-    base = Vector((pier_top.x, pier_top.y, ground_z))
-    cap_h = min(1.0, height * 0.25)
-    add_box_prism(bm, base, r, t, up, width * 0.5, depth * 0.5, height - cap_h, mat_index)
-    add_box_prism(bm, base + up * (height - cap_h), r, t, up, width * 0.5 + 0.9, depth * 0.5 + 0.15, cap_h, mat_index)
+    style 'HAMMERHEAD' is one wide column under a cantilevered cap; 'MULTI' is a row of round
+    columns (one every ~8 m of deck) under a full-width cap beam.
+    """
+    up = Vector((0.0, 0.0, 1.0))
+    tang = normal.cross(right).normalized()
+    soffit = pos + right * center_x - normal * deck_t
+    cap_h = 1.3 if style == 'MULTI' else 1.8
+    cap_w = max(1.5, soffit_w - 0.4)
+    cap_d = col_depth + 0.5
+
+    # The column tops are found under the cap, so check there is room for a pier at all.
+    flat_r = Vector((right.x, right.y, 0.0))
+    flat_r = flat_r.normalized() if flat_r.length > 1e-6 else Vector((1.0, 0.0, 0.0))
+    flat_t = up.cross(flat_r).normalized()
+    cap_base = soffit - normal * cap_h
+
+    if style == 'MULTI':
+        n_cols = max(2, math.ceil(cap_w / 8.0))
+        span = cap_w - 2.0 * max(col_depth, 1.2)
+        xs = [(-span * 0.5 + span * k / (n_cols - 1)) for k in range(n_cols)]
+    else:
+        xs = [0.0]
+
+    tops = [cap_base + right * x for x in xs]
+    if min(t.z for t in tops) - ground_z < 0.8:
+        return  # deck is too close to the ground for a pier here
+
+    add_box_prism(bm, cap_base, right, tang, normal, cap_w * 0.5, cap_d * 0.5, cap_h, mat_index)
+
+    for x, top in zip(xs, tops):
+        height = top.z - ground_z + 0.05  # sink slightly into the cap so there is no gap on banks
+        base = Vector((top.x, top.y, ground_z))
+        if style == 'MULTI':
+            add_cylinder(bm, base, flat_r, flat_t, up, col_depth * 0.5, height, num_segments=16, mat_index=mat_index)
+            foot = col_depth * 0.5 + 0.6
+            add_box_prism(bm, base - up * 0.5, flat_r, flat_t, up, foot, foot, 0.6, mat_index)
+        else:
+            add_box_prism(bm, base, flat_r, flat_t, up, col_width * 0.5, col_depth * 0.5, height, mat_index)
+            add_box_prism(bm, base - up * 0.5, flat_r, flat_t, up, col_width * 0.5 + 0.8, col_depth * 0.5 + 0.8,
+                          0.6, mat_index)
 
 
 def add_cable_stayed_bridge(bm, samples, half_w, tower_spacing, tower_height, deck_t, ground_z):
@@ -764,18 +796,12 @@ def add_toll_plaza_at(bm, plaza_center, right, tangent, normal, num_lanes, booth
 # 4. MASTER PROCEDURAL MESH REBUILDER
 # ==============================================================================
 
-def rebuild_civil_mesh(obj, depsgraph=None):
-    """Main procedural mesh builder triggered whenever parameters or curves change."""
-    if not obj or obj.type != 'MESH' or not obj.civil_props.is_civil_object:
-        return
-    if obj.mode == 'EDIT':
-        return
-
+def road_local_samples(obj, depsgraph=None):
+    """The road's guide curve sampled into frames in the road object's local space."""
     props = obj.civil_props
     curve_obj = props.target_curve
     if not curve_obj or curve_obj.type != 'CURVE':
-        return
-
+        return []
     samples = sample_bezier_curve(
         curve_obj,
         props.resolution_step,
@@ -786,7 +812,7 @@ def rebuild_civil_mesh(obj, depsgraph=None):
         depsgraph=depsgraph,
     )
     if len(samples) < 2:
-        return
+        return []
 
     inv_mat = obj.matrix_world.inverted_safe()
     inv_rot = inv_mat.to_3x3()
@@ -797,6 +823,21 @@ def rebuild_civil_mesh(obj, depsgraph=None):
         l_norm = (inv_rot @ norm).normalized()
         l_right = (inv_rot @ right).normalized()
         local_samples.append((l_pos, l_tang, l_norm, l_right))
+    return local_samples
+
+
+def rebuild_civil_mesh(obj, depsgraph=None):
+    """Main procedural mesh builder triggered whenever parameters or curves change."""
+    if not obj or obj.type != 'MESH' or not obj.civil_props.is_civil_object:
+        return
+    if obj.mode == 'EDIT':
+        return
+
+    props = obj.civil_props
+    local_samples = road_local_samples(obj, depsgraph)
+    if len(local_samples) < 2:
+        return
+    inv_mat = obj.matrix_world.inverted_safe()
 
     ensure_civil_materials(obj)
     bm = bmesh.new()
@@ -1132,21 +1173,42 @@ def rebuild_civil_mesh(obj, depsgraph=None):
                 pole_idx += 1
 
     # 14. Overpass Support Pillars
-    if props.is_overpass and props.add_pillars and not props.add_cable_bridge:
-        dist_accum = 0.0
-        next_pillar_dist = props.pillar_spacing * 0.5
-
+    # A support stands at each end of the deck, with the rest spread evenly between them.
+    # Cable-stayed bridges hang between their towers, so they only get the two end supports.
+    if props.is_overpass and props.add_pillars:
+        cum = [0.0]
         for i in range(1, num_s):
-            p_prev = local_samples[i - 1][0]
-            p_curr, tang, norm, right = local_samples[i]
-            seg_d = (p_curr - p_prev).length
-            dist_accum += seg_d
+            cum.append(cum[-1] + (local_samples[i][0] - local_samples[i - 1][0]).length)
+        deck_len = cum[-1]
+        end_inset = min(1.5, deck_len * 0.05)
+        usable = max(0.0, deck_len - 2.0 * end_inset)
+        if props.add_cable_bridge:
+            pier_ds = [end_inset, deck_len - end_inset]
+        else:
+            n_spans = max(1, round(usable / props.pillar_spacing))
+            pier_ds = [end_inset + usable * k / n_spans for k in range(n_spans + 1)]
 
-            if dist_accum >= next_pillar_dist:
-                next_pillar_dist += props.pillar_spacing
-                pier_top = p_curr - Vector((0.0, 0.0, deck_t * 0.95))
-                p_width = min(max(1.0, total_w * 0.45), props.pillar_width)
-                add_pillar_at(bm, pier_top, right, tang, p_width, props.pillar_depth, local_ground_z, mat_index=1)
+        j = 0
+        for d in pier_ds:
+            while j < num_s - 2 and cum[j + 1] < d:
+                j += 1
+            seg = max(1e-6, cum[j + 1] - cum[j])
+            f = min(1.0, max(0.0, (d - cum[j]) / seg))
+            p0, t0, n0, r0 = local_samples[j]
+            p1, t1, n1, r1 = local_samples[j + 1]
+            pos = p0.lerp(p1, f)
+            normal = n0.lerp(n1, f).normalized()
+            right = r0.lerp(r1, f).normalized()
+            lx = left_road_edges[j] + (left_road_edges[j + 1] - left_road_edges[j]) * f
+            rx = right_road_edges[j] + (right_road_edges[j + 1] - right_road_edges[j]) * f
+            w_curr = rx - lx
+            g_inset = max(0.4, w_curr * 0.18)  # matches the girder profile above
+            soffit_w = w_curr - 2.0 * g_inset
+            style = props.pier_style
+            if style == 'AUTO':
+                style = 'MULTI' if soffit_w > 9.0 else 'HAMMERHEAD'
+            add_pier_bent(bm, pos, right, normal, (lx + rx) * 0.5, soffit_w, deck_t, local_ground_z,
+                          style, min(props.pillar_width, max(1.0, soffit_w * 0.6)), props.pillar_depth)
 
     # Dashed extrusions leave unused ring vertices behind; drop them.
     loose = [v for v in bm.verts if not v.link_faces]
@@ -1157,6 +1219,9 @@ def rebuild_civil_mesh(obj, depsgraph=None):
     bm.to_mesh(obj.data)
     bm.free()
     obj.data.update()
+
+    # Keep this road's traffic lanes on the road as it changes.
+    traffic.update_lane_curves(obj, local_samples)
 
 
 # ==============================================================================
@@ -1536,7 +1601,42 @@ class CIVIL_PG_ObjectProps(bpy.types.PropertyGroup):
         name="Pillar Width", default=2.8, min=0.8, max=15.0, unit='LENGTH', update=update_civil_prop
     )
     pillar_depth: bpy.props.FloatProperty(
-        name="Pillar Depth", default=1.8, min=0.8, max=10.0, unit='LENGTH', update=update_civil_prop
+        name="Pillar Depth", default=1.8, min=0.8, max=10.0, unit='LENGTH',
+        description="Column thickness along the road (the diameter of round columns)",
+        update=update_civil_prop
+    )
+    # Traffic (applied with the Generate Traffic button)
+    traffic_density: bpy.props.FloatProperty(
+        name="Density", default=1.5, min=0.1, max=8.0,
+        description="Vehicles per lane for every 100 m of road"
+    )
+    traffic_speed: bpy.props.FloatProperty(
+        name="Speed (km/h)", default=100.0, min=5.0, max=200.0,
+        description="Typical speed. Kerb lanes run a little slower, inner lanes a little faster"
+    )
+    traffic_truck_share: bpy.props.FloatProperty(
+        name="Trucks", default=0.2, min=0.0, max=1.0, subtype='FACTOR',
+        description="Share of trucks among the vehicles; they keep mostly to the kerb lane"
+    )
+    traffic_seed: bpy.props.IntProperty(
+        name="Seed", default=1, min=0,
+        description="Change to get a different mix and spacing of vehicles"
+    )
+    traffic_left_hand: bpy.props.BoolProperty(
+        name="Drive on Left", default=False,
+        description="Left-hand traffic (UK, Japan, Australia...). Otherwise traffic keeps right"
+    )
+    traffic_collection: bpy.props.PointerProperty(type=bpy.types.Collection)
+
+    pier_style: bpy.props.EnumProperty(
+        name="Pier Style",
+        items=[
+            ('AUTO', "Auto", "Hammerhead piers under narrow decks, multi-column bents under wide ones"),
+            ('HAMMERHEAD', "Hammerhead", "One wide column under a cantilevered cap beam"),
+            ('MULTI', "Multi-Column Bent", "A row of round columns under a full-width cap beam"),
+        ],
+        default='AUTO',
+        update=update_civil_prop
     )
 
 
@@ -1626,6 +1726,7 @@ class CIVIL_OT_CreateRoadPreset(bpy.types.Operator):
             seg.bend = self.bend
             p.use_segments = True
 
+        p.traffic_speed = 50.0 if self.preset_type == 'STREET' else 100.0
         if self.preset_type == 'STREET':
             p.lanes_left = 1
             p.lanes_right = 1
@@ -1666,7 +1767,7 @@ class CIVIL_OT_CreateRoadPreset(bpy.types.Operator):
             p.cable_tower_spacing = 50.0
             p.cable_tower_height = 25.0
             p.is_overpass = True
-            p.add_pillars = False
+            p.add_pillars = True  # end supports only; the towers carry the rest
             p.auto_superelevation = True
 
         elif self.preset_type == 'OVERPASS':
@@ -1920,6 +2021,8 @@ class CIVIL_OT_CreateInterchangeRamp(bpy.types.Operator):
         p.add_guardrails = True
         p.auto_superelevation = True
         p.superelevation_factor = 1.4
+        p.traffic_speed = 60.0
+        p.traffic_truck_share = 0.1
         p.is_overpass = True
         p.add_pillars = True
         p.pillar_spacing = 15.0
@@ -2150,15 +2253,37 @@ class CIVIL_PT_MainPanel(bpy.types.Panel):
                 row.prop(props, "streetlight_height")
                 row.prop(props, "streetlight_arm_length")
 
+            # Traffic
+            tr_box = layout.box()
+            tr_box.label(text="Traffic", icon='AUTO')
+            col = tr_box.column(align=True)
+            col.prop(props, "traffic_density")
+            col.prop(props, "traffic_speed")
+            col.prop(props, "traffic_truck_share", slider=True)
+            row = tr_box.row(align=True)
+            row.prop(props, "traffic_seed")
+            row.prop(props, "traffic_left_hand", toggle=True)
+            row = tr_box.row(align=True)
+            has_traffic = props.traffic_collection is not None
+            row.operator("civil.traffic_generate", icon='PLAY',
+                         text="Regenerate Traffic" if has_traffic else "Generate Traffic")
+            if has_traffic:
+                row.operator("civil.traffic_remove", icon='TRASH', text="")
+                n = sum(1 for o in props.traffic_collection.objects if o.get("cf_kind"))
+                tr_box.label(text=f"{n} vehicles. Press Space to play.", icon='INFO')
+
             # Overpass Piers
             o_box = layout.box()
             o_box.label(text="Overpass Viaduct Piers", icon='MOD_ARCHIMEDES')
             o_box.prop(props, "is_overpass")
             o_box.prop(props, "deck_thickness")
-            if props.is_overpass and not props.add_cable_bridge:
-                o_box.prop(props, "add_pillars")
+            if props.is_overpass:
+                o_box.prop(props, "add_pillars",
+                           text="End Supports" if props.add_cable_bridge else "Generate Support Pillars")
                 if props.add_pillars:
-                    o_box.prop(props, "pillar_spacing")
+                    o_box.prop(props, "pier_style")
+                    if not props.add_cable_bridge:
+                        o_box.prop(props, "pillar_spacing")
                     row = o_box.row(align=True)
                     row.prop(props, "pillar_width")
                     row.prop(props, "pillar_depth")
@@ -2211,7 +2336,7 @@ classes = (
 )
 
 def register():
-    for cls in classes:
+    for cls in classes + traffic.classes:
         bpy.utils.register_class(cls)
     bpy.types.Object.civil_props = bpy.props.PointerProperty(type=CIVIL_PG_ObjectProps)
     if civil_depsgraph_update_handler not in bpy.app.handlers.depsgraph_update_post:
@@ -2221,7 +2346,7 @@ def unregister():
     if civil_depsgraph_update_handler in bpy.app.handlers.depsgraph_update_post:
         bpy.app.handlers.depsgraph_update_post.remove(civil_depsgraph_update_handler)
     del bpy.types.Object.civil_props
-    for cls in reversed(classes):
+    for cls in reversed(classes + traffic.classes):
         bpy.utils.unregister_class(cls)
 
 if __name__ == "__main__":
