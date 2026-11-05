@@ -12,6 +12,7 @@ Real-world terrain for CivilFlow.
 Map data from USGS and USDA is in the public domain.
 """
 
+import http.client
 import math
 import os
 import ssl
@@ -195,10 +196,13 @@ def fill_along(a, fallback=0.0):
 # Roads on the land
 # ------------------------------------------------------------------------------
 
-def _box(z, k):
+def _box(z, k, keep_slope=False):
+    """Moving average over 2k+1 samples. keep_slope continues the end slopes past the ends
+    (odd reflection), so a straight ramp keeps its end height and its grade."""
     if k < 1 or len(z) < 3:
         return z
-    zp = np.pad(z, k, mode="edge")
+    k = min(k, len(z) - 1)
+    zp = np.pad(z, k, mode="reflect", reflect_type="odd") if keep_slope else np.pad(z, k, mode="edge")
     c = np.concatenate([[0.0], np.cumsum(zp)])
     return (c[2 * k + 1:] - c[:-2 * k - 1]) / (2 * k + 1)
 
@@ -244,18 +248,29 @@ def drape(road, samples, ground, pin_start_z=None):
         lift = sel & (need >= z - 0.01)
         z = np.where(lift, need, z)
         w = np.where(lift, 1000.0, w)
-    if pin_start_z is not None:
-        z = z.copy()
-        z[0] = pin_start_z
-        w[0] = 1e6  # the start stays on the end of the road this one continues from
+    # Ends held in place: on the road this one continues from, or ramped down to the ground.
+    start_z = pin_start_z if pin_start_z is not None else (g[0] + 0.3 if p.ramp_start else None)
+    end_z = g[-1] + 0.3 if p.ramp_end else None
+    z = z.copy()
+    if start_z is not None:
+        z[0], w[0] = start_z, 1e6
+    if end_z is not None:
+        z[-1], w[-1] = end_z, 1e6
     z = fit_grade(z, (p.max_grade / 100.0) * np.diff(d), w)
     # Round off the kinks between slopes (vertical curves); averaging keeps the grade limit.
     k = int(round(min(60.0, max(10.0, p.terrain_smoothing * 0.4)) / (2.0 * step)))
-    z = _box(z, k)
-    if pin_start_z is not None:
-        L = max(30.0, p.terrain_smoothing)
+    z = _box(z, k, keep_slope=True)
+    # Smoothing can nudge the ends a little; ease them back onto their pins.
+    L = max(30.0, min(p.terrain_smoothing, d[-1] * 0.25))
+    if start_z is not None:
         t = np.clip(1.0 - d / L, 0.0, 1.0)
-        z = z + (pin_start_z - z[0]) * (t * t * (3.0 - 2.0 * t))
+        z = z + (start_z - z[0]) * (t * t * (3.0 - 2.0 * t))
+    if end_z is not None:
+        t = np.clip(1.0 - (d[-1] - d) / L, 0.0, 1.0)
+        z = z + (end_z - z[-1]) * (t * t * (3.0 - 2.0 * t))
+    lim = (p.max_grade / 100.0) * np.diff(d)
+    if np.any(np.abs(np.diff(z)) > lim + 1e-6):
+        z = fit_grade(z, lim, w)  # the easing must never break the grade limit
 
     up = Vector((0.0, 0.0, 1.0))
     P = [Vector((xs[i], ys[i], z[i])) for i in range(n)]
@@ -353,7 +368,11 @@ def classify(d, surface_z, ground_z, props, manual_tunnel=None, overrides=()):
     mode = np.full(n, ROAD, dtype=np.int64)
     h = surface_z - ground_z
     if props.is_overpass:
-        mode[:] = BRIDGE
+        # An elevated road is a bridge, except where it comes down to the ground (ramped ends).
+        mode[h > 2.0] = BRIDGE
+        for kind, a, b in _runs(mode):
+            if kind == ROAD and 0 < a and b < n - 1 and _run_len(d, a, b) < 30.0:
+                mode[a:b + 1] = BRIDGE
     elif props.auto_bridges:
         mode[h > props.bridge_min_height] = BRIDGE
         # Close short dips back to ground between two bridges, then drop stub bridges.
@@ -802,19 +821,21 @@ def fetch(url, params, path, timeout=180):
         return path
     req = urllib.request.Request(url + "?" + urllib.parse.urlencode(params),
                                  headers={"User-Agent": "CivilFlow-Blender-Extension"})
-    for attempt in range(4):
+    tries = 5
+    for attempt in range(tries):
         try:
             with urllib.request.urlopen(req, timeout=timeout, context=_ssl_context()) as r:
                 data = r.read()
                 ctype = (r.headers.get("Content-Type") or "").lower()
             break
         except urllib.error.HTTPError as e:
-            if e.code < 500 or attempt == 3:
+            if (e.code < 500 and e.code != 429) or attempt == tries - 1:
                 raise
-        except (urllib.error.URLError, TimeoutError, ConnectionError):
-            if attempt == 3:
+        except (urllib.error.URLError, OSError, http.client.HTTPException):
+            # Timeouts, dropped or reset connections, SSL hiccups, truncated replies.
+            if attempt == tries - 1:
                 raise
-        time.sleep(3.0 * (attempt + 1))  # busy server: wait and try again
+        time.sleep(min(20.0, 3.0 * 2 ** attempt))  # busy server: wait and try again
     if "json" in ctype or "html" in ctype or data[:1] in (b"{", b"<"):
         msg = data[:300].decode("utf-8", "replace")
         raise RuntimeError("The USGS server didn't return an image: " + msg)
@@ -823,6 +844,17 @@ def fetch(url, params, path, timeout=180):
         fh.write(data)
     os.replace(tmp, path)
     return path
+
+
+def _describe(err):
+    """A short, readable reason for a failed request."""
+    if isinstance(err, urllib.error.HTTPError):
+        return "the USGS server answered %d %s" % (err.code, err.reason)
+    if isinstance(err, urllib.error.URLError):
+        return "no connection to the USGS server: %s" % err.reason
+    if isinstance(err, (TimeoutError, OSError)) and "timed out" in str(err).lower():
+        return "the USGS server took too long"
+    return "%s: %s" % (type(err).__name__, err)
 
 
 def download_terrain(context, lat, lon, width_m, height_m, spacing, imagery=True, image_res=0.6):
@@ -844,10 +876,14 @@ def download_terrain(context, lat, lon, width_m, height_m, spacing, imagery=True
     folder = _download_dir()
     tag = "%.5f_%.5f_%dx%d" % (lat, lon, round(width_m), round(height_m))
 
-    dem_path = fetch(DEM_URL, dict(bbox=bbox, bboxSR=epsg, imageSR=epsg, size="%d,%d" % (nxp, nyp),
-                                   format="tiff", pixelType="F32", interpolation="RSP_BilinearInterpolation",
-                                   noDataInterpretation="esriNoDataMatchAny", f="image"),
-                     os.path.join(folder, "dem_%s_%gm.tif" % (tag, spacing)))
+    try:
+        dem_path = fetch(DEM_URL, dict(bbox=bbox, bboxSR=epsg, imageSR=epsg, size="%d,%d" % (nxp, nyp),
+                                       format="tiff", pixelType="F32", interpolation="RSP_BilinearInterpolation",
+                                       noDataInterpretation="esriNoDataMatchAny", f="image"),
+                         os.path.join(folder, "dem_%s_%gm.tif" % (tag, spacing)))
+    except Exception as e:
+        raise RuntimeError("the elevation data didn't arrive (%s). Try Download again in a minute"
+                           % _describe(e)) from e
     t = geo.GeoTiff(dem_path)
     try:
         rows = t.read()
@@ -903,7 +939,13 @@ def download_photo(xmin, ymin, width_m, height_m, image_res, spacing, epsg, fold
                     core[2] if i < nx - 1 else 1e12, core[3] if j < ny - 1 else 1e12)
             jobs.append((params, path, box, core))
     with ThreadPoolExecutor(max_workers=PHOTO_WORKERS) as pool:
-        list(pool.map(lambda job: fetch(NAIP_URL, job[0], job[1]), jobs))
+        futures = [pool.submit(fetch, NAIP_URL, job[0], job[1]) for job in jobs]
+    errors = [f.exception() for f in futures if f.exception() is not None]
+    if errors:
+        done = len(jobs) - len(errors)
+        raise RuntimeError(
+            "%d of %d photo pieces didn't arrive (%s). Click Download again: the %d that did are "
+            "saved, so it only fetches what's missing" % (len(errors), len(jobs), _describe(errors[0]), done))
 
     photos = []
     for params, path, box, core in jobs:

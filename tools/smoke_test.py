@@ -270,6 +270,29 @@ def terrain_tests(mod, failures):
     diff = float(np.max(np.abs(co[2::3] - orig)))
     report("TERRAIN RESET", diff < 1e-4 and left == 0, f"terrain back to original (max change {diff:.5f} m, openings {left})")
 
+    # An elevated road whose ends ramp down to meet the ground.
+    curve = mod.create_guide_curve(bpy.context, "RampTest", [(-400.0, -280.0, 0.0), (-400.0, 280.0, 0.0)])
+    for o in bpy.context.selected_objects:
+        o.select_set(False)
+    curve.select_set(True)
+    bpy.context.view_layer.objects.active = curve
+    bpy.ops.civil.create_road_preset(preset_type='OVERPASS')
+    ramp = bpy.context.active_object
+    rp = ramp.civil_props
+    rp.ramp_start = True
+    rp.ramp_end = True
+    smp_r = mod.road_local_samples(ramp)
+    P = np.array([tuple(ramp.matrix_world @ sp[0]) for sp in smp_r])
+    above = P[:, 2] - g.world_heights(P[:, 0], P[:, 1])
+    grade_r = float(np.max(np.abs(np.diff(P[:, 2])) / np.linalg.norm(np.diff(P[:, :2], axis=0), axis=1))) * 100.0
+    mode_r = T._CARVE[ramp.name]["mode"]
+    ok = (abs(above[0] - 0.3) < 0.3 and abs(above[-1] - 0.3) < 0.3 and above.max() > rp.terrain_offset - 0.5
+          and grade_r <= rp.max_grade + 0.05 and mode_r[0] == T.ROAD and mode_r[-1] == T.ROAD
+          and T.BRIDGE in set(mode_r.tolist()))
+    report("TERRAIN RAMPS", ok, f"elevated road: start {above[0]:.2f} m and end {above[-1]:.2f} m above ground, "
+           f"peak {above.max():.1f} m (asked {rp.terrain_offset:g}), max grade {grade_r:.2f}%")
+    bpy.data.objects.remove(ramp)
+
     # Photo tiles: each face takes the tile whose core holds it and stays inside that tile's image.
     res, tnx, tny, tx, ty, margin = T.plan_photo(3000.0, 2000.0, 0.3, 4.0)
     ex = np.arange(-1500.0, 1500.0 + 1e-6, 8.0) + 400000.0

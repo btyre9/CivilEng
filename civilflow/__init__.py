@@ -2011,6 +2011,17 @@ class CIVIL_PG_ObjectProps(bpy.types.PropertyGroup):
         description="Length over which bumps in the ground are evened out",
         update=update_civil_prop
     )
+    ramp_start: bpy.props.BoolProperty(
+        name="Start at Ground", default=False,
+        description="Ramp the start of the road down to the ground (within the max grade), "
+                    "e.g. where an elevated highway comes down to meet the land",
+        update=update_civil_prop
+    )
+    ramp_end: bpy.props.BoolProperty(
+        name="End at Ground", default=False,
+        description="Ramp the end of the road down to the ground (within the max grade)",
+        update=update_civil_prop
+    )
     auto_bridges: bpy.props.BoolProperty(
         name="Auto Bridges", default=True,
         description="Build a bridge with piers wherever the road is high above the ground",
@@ -3052,6 +3063,9 @@ class CIVIL_PT_MainPanel(bpy.types.Panel):
                     col.prop(props, "terrain_offset")
                     col.prop(props, "max_grade")
                     col.prop(props, "terrain_smoothing")
+                    row = g_box.row(align=True)
+                    row.prop(props, "ramp_start", toggle=True, icon='TRIA_DOWN_BAR')
+                    row.prop(props, "ramp_end", toggle=True, icon='TRIA_DOWN_BAR')
                 row = g_box.row(align=True)
                 row.prop(props, "auto_bridges")
                 sub = row.row(align=True)

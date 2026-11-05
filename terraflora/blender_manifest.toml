@@ -1,0 +1,20 @@
+schema_version = "1.0.0"
+
+id = "terraflora"
+version = "0.1.0"
+name = "TerraFlora: Forests from Aerial Photos"
+tagline = "Trees, shrubs and clearings grown from real aerial photos"
+maintainer = "AI Assistant"
+type = "add-on"
+
+tags = ["Add Mesh", "Object"]
+
+blender_version_min = "5.1.0"
+
+license = ["SPDX:GPL-3.0-or-later"]
+
+[permissions]
+network = "Download aerial photo bands and USGS land cover"
+
+[build]
+paths_exclude_pattern = ["__pycache__/", "/.git/", "*.zip", "._*", ".DS_Store"]

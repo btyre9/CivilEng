@@ -320,6 +320,32 @@ class GeoTiff:
             arr = np.cumsum(arr, axis=1, dtype=dt)
         return arr
 
+    def read_bands(self, x0=0, y0=0, w=None, h=None):
+        """All bands of the pixel window as an (h, w, bands) array of the stored type (interleaved files)."""
+        w = self.width - x0 if w is None else w
+        h = self.height - y0 if h is None else h
+        if self.planar != 1:
+            raise ValueError("separate-plane multi-band TIFFs aren't supported")
+        out = np.zeros((h, w, self.spp), dtype=self._dtype())
+        if self.tiled:
+            across = (self.width + self.tw - 1) // self.tw
+            for ty in range(y0 // self.th, (y0 + h - 1) // self.th + 1):
+                for tx in range(x0 // self.tw, (x0 + w - 1) // self.tw + 1):
+                    blk = self._block(ty * across + tx, self.th)
+                    bx, by = tx * self.tw, ty * self.th
+                    sx0, sy0 = max(x0, bx), max(y0, by)
+                    sx1, sy1 = min(x0 + w, bx + self.tw, self.width), min(y0 + h, by + self.th, self.height)
+                    if sx1 > sx0 and sy1 > sy0:
+                        out[sy0 - y0:sy1 - y0, sx0 - x0:sx1 - x0] = blk[sy0 - by:sy1 - by, sx0 - bx:sx1 - bx]
+        else:
+            for s in range(y0 // self.th, (y0 + h - 1) // self.th + 1):
+                rows = min(self.th, self.height - s * self.th)
+                blk = self._block(s, rows)
+                by = s * self.th
+                sy0, sy1 = max(y0, by), min(y0 + h, by + rows)
+                out[sy0 - y0:sy1 - y0] = blk[sy0 - by:sy1 - by, x0:x0 + w]
+        return out
+
     def read(self, x0=0, y0=0, w=None, h=None):
         """Band 0 of the pixel window (columns x0.., rows y0..) as float32 with nodata -> nan."""
         w = self.width - x0 if w is None else w
