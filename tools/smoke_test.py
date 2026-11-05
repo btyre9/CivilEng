@@ -6,7 +6,8 @@ Run from the repo root:
         --python tools/smoke_test.py -- [--render OUT_DIR]
 
 Loads civilflow/ straight from this checkout (no install needed), builds every preset on its
-default curve, checks the meshes, and optionally renders a Workbench preview of each.
+default curve, checks the meshes, traffic and roads on a synthetic terrain (no network needed),
+and optionally renders a Workbench preview of each.
 Exits non-zero if any check fails.
 """
 import sys
@@ -83,6 +84,234 @@ def render_preview(obj, path):
     scene.render.filepath = path
     bpy.ops.render.render(write_still=True)
     bpy.data.objects.remove(cam, do_unlink=True)
+
+
+def write_geotiff(path, arr, x0, y0, px, epsg, predictor):
+    """Minimal single-strip, Deflate-compressed GeoTIFF writer (float32 or int16), north-up rows."""
+    import struct
+    import zlib
+    import numpy as np
+    h, w = arr.shape
+    is_float = arr.dtype == np.float32
+    bps = 4 if is_float else 2
+    rows = []
+    for r in arr:
+        r = np.ascontiguousarray(r.astype("<f4" if is_float else "<i2"))
+        if predictor == 3:  # floating-point predictor: byte planes, most significant first, differenced
+            b = r.view(np.uint8).reshape(w, bps)[:, ::-1].T.ravel().copy()
+            b[1:] = (b[1:].astype(np.int16) - b[:-1].astype(np.int16)).astype(np.uint8)
+            rows.append(b.tobytes())
+        elif predictor == 2:
+            d = r.copy()
+            d[1:] = (r[1:].astype(np.int32) - r[:-1].astype(np.int32)).astype("<i2")
+            rows.append(d.tobytes())
+        else:
+            rows.append(r.tobytes())
+    data = zlib.compress(b"".join(rows))
+    extra = {33550: struct.pack("<3d", px, px, 0.0),
+             33922: struct.pack("<6d", 0, 0, 0, x0, y0, 0),
+             34735: struct.pack("<16H", 1, 1, 0, 3, 1024, 0, 1, 1, 1025, 0, 1, 1, 3072, 0, 1, epsg)}
+    tags = [(256, 3, 1, w), (257, 3, 1, h), (258, 3, 1, bps * 8), (259, 3, 1, 8), (262, 3, 1, 1),
+            (273, 4, 1, None), (277, 3, 1, 1), (278, 3, 1, h), (279, 4, 1, len(data)),
+            (317, 3, 1, predictor), (339, 3, 1, 3 if is_float else 2),
+            (33550, 12, 3, "x"), (33922, 12, 6, "x"), (34735, 3, 16, "x")]
+    out = bytearray(b"II*\x00" + struct.pack("<I", 0))
+    data_off = len(out)
+    out += data
+    if len(out) % 2:
+        out += b"\x00"
+    extra_off = {}
+    for tag, blob in extra.items():
+        extra_off[tag] = len(out)
+        out += blob
+    ifd_off = len(out)
+    out[4:8] = struct.pack("<I", ifd_off)
+    out += struct.pack("<H", len(tags))
+    for tag, typ, cnt, val in tags:
+        if tag == 273:
+            val = data_off
+        if val == "x":
+            out += struct.pack("<HHII", tag, typ, cnt, extra_off[tag])
+        elif typ == 3:
+            out += struct.pack("<HHIHH", tag, typ, cnt, val, 0)
+        else:
+            out += struct.pack("<HHII", tag, typ, cnt, val)
+    out += struct.pack("<I", 0)
+    with open(path, "wb") as fh:
+        fh.write(out)
+
+
+def terrain_tests(mod, failures):
+    """Synthetic land with a valley and a hill: bridges, tunnels, banks, cuts and portals."""
+    import tempfile
+    import numpy as np
+    from mathutils.bvhtree import BVHTree
+    T = sys.modules["civilflow.terrain"]
+    G = sys.modules["civilflow.geo"]
+
+    def report(name, ok, msg):
+        print(f"[{'OK ' if ok else 'BAD'}] {name:13s} {msg}")
+        if not ok:
+            failures.append(name)
+
+    # Map maths
+    e, n = G.latlon_to_utm(34.866, -118.887, 11)
+    lat, lon = G.utm_to_latlon(e, n, 11)
+    parsed = [G.parse_latlon(t) for t in ("34.866, -118.887", "34.866 -118.887", "34°51'57.6\"N 118°53'13.2\"W")]
+    ok = (abs(float(lat) - 34.866) < 1e-8 and abs(float(lon) + 118.887) < 1e-8
+          and all(p is not None and abs(p[0] - 34.866) < 1e-4 and abs(p[1] + 118.887) < 1e-4 for p in parsed))
+    report("GEO", ok, f"UTM round trip {abs(float(lat) - 34.866):.1e} deg; lat/long text formats parsed={ok}")
+
+    clear_scene()
+    for key in ("cf_geo",):
+        if key in bpy.context.scene:
+            del bpy.context.scene[key]
+    x = np.arange(-500.0, 500.0 + 1e-6, 4.0)
+    y = np.arange(-300.0, 300.0 + 1e-6, 4.0)
+    X, Y = np.meshgrid(x, y)
+    def land(X, Y):
+        return 100.0 + 45.0 * np.exp(-((X - 200.0) / 70.0) ** 2) - 32.0 * np.exp(-((X + 150.0) / 60.0) ** 2) + 0.02 * Y
+    ter = T.build_terrain(bpy.context, "Terrain_Test", 400000.0 + x, 3800000.0 + y, land(X, Y), 11, True)
+    g = T.ground_for(ter)
+    z0 = bpy.context.scene["cf_geo"]["z0"]
+    probe = g.world_heights([-150.0, 200.0, 13.0], [0.0, 10.0, -77.0])
+    want = land(np.array([-150.0, 200.0, 13.0]), np.array([0.0, 10.0, -77.0])) - z0
+    err = float(np.max(np.abs(probe - want)))
+    report("TERRAIN BUILD", len(ter.data.vertices) == len(x) * len(y) and err < 0.6,
+           f"{len(ter.data.vertices)} verts, ground query error {err:.2f} m (4 m grid)")
+
+    # A highway built from the 3D cursor picks the terrain up and follows it.
+    bpy.context.scene.cursor.location = (-480.0, 0.0, 0.0)
+    for o in bpy.context.selected_objects:
+        o.select_set(False)
+    bpy.context.view_layer.objects.active = None
+    bpy.ops.civil.create_road_preset(preset_type='HIGHWAY', length=960.0)
+    road = bpy.context.active_object
+    p = road.civil_props
+    rec = T._CARVE.get(road.name)
+    smp = mod.road_local_samples(road)
+    zs = np.array([s[0].z for s in smp])
+    xy = np.array([(s[0].x, s[0].y) for s in smp])
+    grade = float(np.max(np.abs(np.diff(zs)) / np.linalg.norm(np.diff(xy, axis=0), axis=1))) * 100.0
+    kinds = {k for k, _a, _b in T._runs(rec["mode"])} if rec else set()
+    ok = (p.terrain_object == ter and p.follow_terrain and grade <= p.max_grade + 0.05
+          and T.BRIDGE in kinds and T.TUNNEL in kinds)
+    report("TERRAIN ROAD", ok, f"on terrain={p.terrain_object == ter}, max grade {grade:.2f}% (limit {p.max_grade:g}), "
+           f"stretches {sorted(['ROAD', 'BRIDGE', 'TUNNEL'][k] for k in kinds)}")
+
+    # Piers stand on the valley floor.
+    me = road.data
+    vz = np.array([(v.co.x, v.co.z) for v in me.vertices])
+    near = vz[np.abs(vz[:, 0] + 150.0) < 25.0]
+    floor = float(np.min(g.world_heights(np.linspace(-175, -125, 11), np.zeros(11))))
+    pier_low = float(near[:, 1].min()) if len(near) else 1e9
+    report("TERRAIN PIERS", abs(pier_low - floor) < 1.5,
+           f"lowest pier point {pier_low:.1f} m, valley floor {floor:.1f} m")
+
+    # Nothing of the terrain is left over the road outside the tunnel, portals included.
+    dg = bpy.context.evaluated_depsgraph_get()
+    bvh = BVHTree.FromObject(ter, dg)
+    hits = 0
+    half = (p.lanes_left + p.lanes_right) * p.lane_width * 0.5 + p.median_width * 0.5 + p.shoulder_width
+    for i, (pos, _t, nr, r) in enumerate(smp):
+        if rec["mode"][i] == T.TUNNEL:
+            continue
+        for off in np.linspace(-half, half, 7):
+            q = road.matrix_world @ (pos + r * off + nr * 0.1)
+            if bvh.ray_cast(q, Vector((0.0, 0.0, 1.0)), 80.0)[0] is not None:
+                hits += 1
+    holes = int(np.count_nonzero([d.value for d in ter.data.attributes["cf_hole"].data])) \
+        if "cf_hole" in ter.data.attributes else 0
+    report("TERRAIN CLEAR", hits == 0 and holes > 0 and ter.modifiers.get(T.HOLE_MOD) is not None,
+           f"road points under terrain: {hits}; portal openings: {holes} faces")
+
+    # Your own structures: an overpass on a flat stretch, an earth bank instead of the valley bridge.
+    bpy.context.view_layer.objects.active = road
+    bpy.context.scene.cursor.location = (-400.0, 0.0, 0.0)
+    bpy.ops.civil.structure_add(kind='BRIDGE')
+    st = p.structures[0]
+    bpy.context.scene.cursor.location = (-150.0, 0.0, 0.0)
+    bpy.ops.civil.structure_add(kind='BANK')
+    rec = T._CARVE[road.name]
+    smp_o = mod.road_local_samples(road)
+    xs_o = np.array([sp[0].x for sp in smp_o])
+    zs_o = np.array([sp[0].z for sp in smp_o])
+    i_br = int(np.argmin(np.abs(xs_o + 400.0)))
+    i_bank = int(np.argmin(np.abs(xs_o + 150.0)))
+    g_br = float(g.world_heights([xs_o[i_br]], [0.0])[0])
+    clear = zs_o[i_br] - p.deck_thickness - g_br
+    vz = np.array([(v.co.x, v.co.z) for v in road.data.vertices])
+    under = vz[(np.abs(vz[:, 0] + 400.0) < st.clear_span * 0.5) & (vz[:, 1] < zs_o[i_br] - p.deck_thickness - 1.0)]
+    valley_bridge = any(rec["mode"][i] == T.BRIDGE for i in range(len(xs_o)) if abs(xs_o[i] + 150.0) < 25.0)
+    ok = (rec["mode"][i_br] == T.BRIDGE and clear >= st.clearance - 0.5 and len(under) == 0
+          and rec["mode"][i_bank] == T.ROAD and not valley_bridge)
+    report("TERRAIN YOURS", ok, f"overpass placed: bridge={rec['mode'][i_br] == T.BRIDGE}, clearance {clear:.1f} m "
+           f"(asked {st.clearance:g}), pillar parts in its clear span {len(under)}; "
+           f"earth bank replaced valley bridge={not valley_bridge}")
+    while len(p.structures):
+        bpy.ops.civil.structure_remove()
+
+    # A road continued from it starts exactly on its end and keeps following the land.
+    bpy.ops.civil.road_continue(preset_type='HIGHWAY', length=150.0, bend=-20.0)
+    road2 = bpy.context.active_object
+    s2 = mod.road_local_samples(road2)
+    gap = ((road2.matrix_world @ s2[0][0]) - (road.matrix_world @ smp[-1][0])).length
+    report("TERRAIN JOIN", road2.civil_props.terrain_object == ter and gap < 0.05,
+           f"continued road on terrain={road2.civil_props.terrain_object == ter}, join gap {gap:.3f} m")
+
+    # Taking the roads off the terrain puts the land back as it was.
+    road.civil_props.terrain_object = None
+    road2.civil_props.terrain_object = None
+    co = np.empty(len(ter.data.vertices) * 3, dtype=np.float32)
+    ter.data.vertices.foreach_get("co", co)
+    orig = np.empty(len(ter.data.vertices), dtype=np.float32)
+    ter.data.attributes["cf_ground"].data.foreach_get("value", orig)
+    left = int(np.count_nonzero([d.value for d in ter.data.attributes["cf_hole"].data]))
+    diff = float(np.max(np.abs(co[2::3] - orig)))
+    report("TERRAIN RESET", diff < 1e-4 and left == 0, f"terrain back to original (max change {diff:.5f} m, openings {left})")
+
+    # Photo tiles: each face takes the tile whose core holds it and stays inside that tile's image.
+    res, tnx, tny, tx, ty, margin = T.plan_photo(3000.0, 2000.0, 0.3, 4.0)
+    ex = np.arange(-1500.0, 1500.0 + 1e-6, 8.0) + 400000.0
+    ny_ = np.arange(-1000.0, 1000.0 + 1e-6, 8.0) + 3800000.0
+    photos = []
+    for j in range(tny):
+        for i in range(tnx):
+            c0, r0 = ex[0] + i * tx, ny_[0] + j * ty
+            box = (c0 - margin, r0 - margin, c0 + tx + margin, r0 + ty + margin)
+            core = (c0 if i else -1e12, r0 if j else -1e12,
+                    c0 + tx if i < tnx - 1 else 1e12, r0 + ty if j < tny - 1 else 1e12)
+            img = bpy.data.images.new("tile_%d_%d" % (i, j), 8, 8)
+            photos.append((img, lambda E_, N_, b=box: ((E_ - b[0]) / (b[2] - b[0]), (N_ - b[1]) / (b[3] - b[1])), core))
+    EE, NN = np.meshgrid(ex, ny_)
+    tob = T.build_terrain(bpy.context, "Terrain_Tiles", ex, ny_, np.zeros_like(EE) + 150.0, 11, True, photos)
+    uvs = np.empty(len(tob.data.loops) * 2, dtype=np.float32)
+    tob.data.uv_layers[0].data.foreach_get("uv", uvs)
+    used = np.empty(len(tob.data.polygons), dtype=np.int32)
+    tob.data.polygons.foreach_get("material_index", used)
+    ok = (len(tob.data.materials) == tnx * tny and len(set(used.tolist())) == tnx * tny
+          and uvs.min() >= 0.0 and uvs.max() <= 1.0)
+    report("TERRAIN PHOTO", ok, f"3 x 2 km at {res:g} m: {tnx} x {tny} tiles, all used={len(set(used.tolist())) == tnx * tny}, "
+           f"UVs {uvs.min():.3f}..{uvs.max():.3f}")
+    bpy.data.objects.remove(tob)
+
+    # GeoTIFF files: float32 + floating-point predictor, int16 + horizontal predictor, both Deflate.
+    tmp = tempfile.mkdtemp()
+    for name, dtype, pred in (("dem_f32.tif", np.float32, 3), ("dem_i16.tif", np.int16, 2)):
+        cols, rws, px = 60, 50, 10.0
+        ex = 401000.0 + px * (np.arange(cols) + 0.5)
+        ny = 3800300.0 - px * (np.arange(rws) + 0.5)
+        EE, NN = np.meshgrid(ex, ny)
+        vals = 200.0 + 0.05 * (EE - 401000.0) - 0.03 * (NN - 3800000.0)
+        path = os.path.join(tmp, name)
+        write_geotiff(path, vals.astype(dtype), 401000.0, 3800300.0, px, 32611, pred)
+        obj, _ = T.import_terrain_file(bpy.context, path, "", spacing=10.0, crop_m=0.0)
+        gx, gy = 401300.0 - 400000.0, 3800050.0 - 3800000.0
+        h = float(T.ground_for(obj).world_heights([gx], [gy])[0]) + z0
+        want = 200.0 + 0.05 * 300.0 - 0.03 * 50.0
+        tol = 0.6 if dtype == np.int16 else 0.05
+        report("TERRAIN FILE", abs(h - want) < tol,
+               f"{name}: {len(obj.data.vertices)} verts, height at a test point {h:.2f} m (want {want:.2f})")
 
 
 def main():
@@ -415,6 +644,8 @@ def main():
           f"angle={math.degrees(max(tilts)):.1f} deg")
     if not ok:
         failures.append("TILT")
+
+    terrain_tests(mod, failures)
 
     mod.unregister()
     if failures:

@@ -1,10 +1,10 @@
 bl_info = {
     "name": "CivilFlow: Road, Highway & Overpass Generator",
     "author": "AI Assistant",
-    "version": (1, 9, 0),
+    "version": (1, 10, 0),
     "blender": (5, 1, 0),
     "location": "View3D > Sidebar (N) > CivilEng",
-    "description": "Procedural roads built from straights and curves, highways, banking, guardrails, gantry signs, tunnels, embankments, cable-stayed towers, toll plazas, and animated low-poly traffic.",
+    "description": "Procedural roads built from straights and curves, highways, banking, guardrails, gantry signs, tunnels, embankments, cable-stayed towers, toll plazas, animated low-poly traffic, and real USGS terrain with automatic bridges, tunnels and earthworks.",
     "category": "Add Mesh",
 }
 
@@ -13,7 +13,10 @@ import bmesh
 from mathutils import Vector, Matrix
 import math
 
+import numpy as np
+
 from . import traffic
+from . import terrain
 
 # ==============================================================================
 # 1. PROCEDURAL MATERIALS HELPER (BLENDER 5.x API)
@@ -509,17 +512,25 @@ def add_exit_gore_striping(bm, samples, base_x, side, gore_widths, asphalt_h, li
         add_slab(bm, pts, norm, 0.012, mat_index=5)
 
 
-def add_embankment_slopes(bm, samples, left_edges, right_edges, ground_z, verge_w=0.0, mat_index=9):
+def add_embankment_slopes(bm, samples, left_edges, right_edges, ground_z, verge_w=0.0, mat_index=9,
+                          terrain_rings=None):
     """
     Constructs sloped earth berms (embankments) from the outer road edges down to ground_z.
     A flat verge of `verge_w` runs from the asphalt edge out past the sidewalks, barriers,
     walls and posts before the slope starts, so the slope never cuts through them.
+    terrain_rings, when given, is {side: [(edge, top, toe), ...]} worked out against real ground:
+    fills slope down to it and cuts slope up to it.
     """
     if len(samples) < 2:
         return
 
     verge_z = -0.01  # just under the sidewalk underside, so the two never z-fight
     for side, edge_list in ((-1.0, left_edges), (1.0, right_edges)):
+        if terrain_rings is not None:
+            rings = [[bm.verts.new(p) for p in ring[:3]] for ring in terrain_rings[side]]
+            walls = [ring[3] for ring in terrain_rings[side]]
+            _slope_faces(bm, rings, side, mat_index, walls)
+            continue
         rings = []
         for i, (pos, tangent, normal, right) in enumerate(samples):
             ex = edge_list[i]
@@ -533,16 +544,72 @@ def add_embankment_slopes(bm, samples, left_edges, right_edges, ground_z, verge_
             world_toe = world_top + out * (side * berm_w)
             world_toe.z = ground_z
             rings.append([bm.verts.new(p) for p in (world_edge, world_top, world_toe)])
+        _slope_faces(bm, rings, side, mat_index)
 
-        for i in range(len(rings) - 1):
-            a, b = rings[i], rings[i + 1]
-            for k in range(2):
-                quad = (a[k], b[k], b[k + 1], a[k + 1]) if side > 0 else (a[k], a[k + 1], b[k + 1], b[k])
-                try:
-                    f = bm.faces.new(quad)
-                    f.material_index = mat_index
-                except ValueError:
-                    pass
+
+def _slope_faces(bm, rings, side, mat_index, walls=None):
+    for i in range(len(rings) - 1):
+        a, b = rings[i], rings[i + 1]
+        for k in range(2):
+            quad = (a[k], b[k], b[k + 1], a[k + 1]) if side > 0 else (a[k], a[k + 1], b[k + 1], b[k])
+            try:
+                f = bm.faces.new(quad)
+                wall = k == 1 and walls is not None and (walls[i] or walls[i + 1])
+                f.material_index = 1 if wall else mat_index
+            except ValueError:
+                pass
+
+
+def terrain_slope_rings(obj, ground, samples, edges, side, verge_w, max_reach=140.0, fill_reach=30.0):
+    """
+    (edge, top, toe, is_wall) per sample for one side of the road: a flat verge, then a bank that
+    runs down (fill, terrain.SLOPE:1) or up (cut, terrain.SLOPE_CUT:1) until it meets the real
+    ground. A fill that would spread further than fill_reach (a hillside steeper than the bank)
+    becomes a concrete retaining wall straight down to the ground instead.
+    """
+    n = len(samples)
+    edges_p, tops, outs = [], [], []
+    for i, (pos, _t, normal, right) in enumerate(samples):
+        e = pos + right * edges[i] + normal * -0.01
+        top = e + right * (side * verge_w)
+        out = Vector((right.x, right.y, 0.0))
+        out = out.normalized() if out.length > 1e-6 else Vector((1.0, 0.0, 0.0))
+        edges_p.append(e)
+        tops.append(top)
+        outs.append(out * side)
+    T = np.array([tuple(t) for t in tops])
+    O = np.array([tuple(o) for o in outs])
+    D = np.arange(0.0, max_reach + 1e-6, 1.0)
+    P = T[:, None, :] + O[:, None, :] * D[None, :, None]
+    G = terrain.local_heights(obj, ground, P.reshape(-1, 3)).reshape(n, len(D))
+    g0 = G[:, 0]
+    fill = ~(T[:, 2] < g0)  # unknown ground counts as fill
+    sgn = np.where(fill, -1.0, 1.0)
+    S = np.where(fill, terrain.SLOPE, terrain.SLOPE_CUT)
+    line = T[:, 2:3] + sgn[:, None] * D[None, :] / S[:, None]
+    f = (line - G) * (-sgn[:, None])  # <= 0 once the bank has met the ground
+    rings = []
+    for i in range(n):
+        crossed = np.nonzero(np.nan_to_num(f[i], nan=1.0) <= 0.0)[0]
+        if len(crossed) and crossed[0] > 0:
+            k = crossed[0]
+            f0, f1 = f[i, k - 1], f[i, k]
+            dist = D[k - 1] + (D[k] - D[k - 1]) * (f0 / (f0 - f1) if f0 != f1 else 1.0)
+        elif len(crossed):
+            dist = 0.3
+        else:
+            gz = g0[i] if not np.isnan(g0[i]) else T[i, 2] - 3.0
+            dist = min(max_reach, abs(T[i, 2] - gz) * S[i])
+        if fill[i] and dist > fill_reach and not np.isnan(g0[i]):
+            toe = tops[i] + outs[i] * 0.05
+            toe.z = g0[i] - 0.5
+            rings.append((edges_p[i], tops[i], toe, True))
+            continue
+        toe = tops[i] + outs[i] * dist
+        # A fill's toe tucks under the ground; a cut ends on it (the terrain is carved below the cut).
+        toe.z = T[i, 2] + sgn[i] * dist / S[i] - (0.25 if fill[i] else 0.0)
+        rings.append((edges_p[i], tops[i], toe, False))
+    return rings
 
 
 def add_tunnel_section(bm, samples, left_edges, right_edges, clearance_h, wall_t, arched, asphalt_h):
@@ -823,14 +890,23 @@ def add_pier_bent(bm, pos, right, normal, center_x, soffit_w, deck_t, ground_z, 
         xs = [0.0]
 
     tops = [cap_base + right * x for x in xs]
-    if min(t.z for t in tops) - ground_z < 0.8:
+    # ground_z is a height, or a function giving the ground height under a point (None off the map)
+    if callable(ground_z):
+        grounds = [ground_z(t) for t in tops]
+        known = [gz for gz in grounds if gz is not None]
+        if not known:
+            return
+        grounds = [gz if gz is not None else min(known) for gz in grounds]
+    else:
+        grounds = [ground_z] * len(tops)
+    if min(t.z - gz for t, gz in zip(tops, grounds)) < 0.8:
         return  # deck is too close to the ground for a pier here
 
     add_box_prism(bm, cap_base, right, tang, normal, cap_w * 0.5, cap_d * 0.5, cap_h, mat_index)
 
-    for x, top in zip(xs, tops):
-        height = top.z - ground_z + 0.05  # sink slightly into the cap so there is no gap on banks
-        base = Vector((top.x, top.y, ground_z))
+    for x, top, gz in zip(xs, tops, grounds):
+        height = top.z - gz + 0.05  # sink slightly into the cap so there is no gap on banks
+        base = Vector((top.x, top.y, gz))
         if style == 'MULTI':
             add_cylinder(bm, base, flat_r, flat_t, up, col_depth * 0.5, height, num_segments=16, mat_index=mat_index)
             foot = col_depth * 0.5 + 0.6
@@ -878,7 +954,8 @@ def add_cable_stayed_bridge(bm, samples, half_w, tower_spacing, tower_height, de
             base = p_pos + right * (side * leg_x)
             knee = base + up * knee_h
             ground_pt = base.copy()
-            ground_pt.z = ground_z
+            gz = ground_z(base) if callable(ground_z) else ground_z
+            ground_pt.z = gz if gz is not None else base.z
             if knee.z - ground_pt.z > 0.5:
                 add_cylinder_between(bm, ground_pt, knee, radius=0.95, num_segments=8, mat_index=1)
             add_cylinder_between(bm, knee, apex + r_up * (side * 0.7), radius=0.8, num_segments=8, mat_index=1)
@@ -987,10 +1064,50 @@ def road_local_samples(obj, depsgraph=None):
         l_norm = (inv_rot @ norm).normalized()
         l_right = (inv_rot @ right).normalized()
         local_samples.append((l_pos, l_tang, l_norm, l_right))
+
+    # Following the land: height from the terrain, smoothed and held to the grade limit.
+    t_obj = props.terrain_object
+    if props.follow_terrain and t_obj and t_obj.type == 'MESH' and t_obj != obj and obj.name not in _draping:
+        ground = terrain.ground_for(t_obj)
+        pin = None
+        prev = props.attached_to
+        if prev and prev != obj and prev.civil_props.is_civil_object and prev.civil_props.target_curve:
+            _draping.add(obj.name)
+            try:
+                prev_samples = road_local_samples(prev, depsgraph)
+            finally:
+                _draping.discard(obj.name)
+            if prev_samples:
+                pin = (prev.matrix_world @ prev_samples[-1][0]).z
+        local_samples = terrain.drape(obj, local_samples, ground, pin)
     return local_samples
 
 
-def rebuild_civil_mesh(obj, depsgraph=None):
+_draping = set()
+
+
+def add_abutment(bm, sample, lx, rx, ground_at, toward):
+    """Concrete end wall where a bridge deck meets the earth bank, from the ground up to the deck."""
+    pos, tang, norm, right = sample
+    t_up, r_up, up = flat_frame(tang)
+    edge_l, edge_r = pos + right * lx, pos + right * rx
+    center = pos + right * ((lx + rx) * 0.5)
+    known = [g for g in (ground_at(edge_l), ground_at(center), ground_at(edge_r)) if g is not None]
+    if not known:
+        return
+    bottom = min(known) - 0.6
+    top = min(edge_l.z, edge_r.z) - 0.12
+    if top - bottom < 0.6:
+        return
+    base = Vector((center.x, center.y, bottom)) + t_up * (toward * 0.9)
+    add_box_prism(bm, base, r_up, t_up, up, (rx - lx) * 0.5 + 0.8, 0.9, top - bottom, mat_index=1)
+
+
+def _rebuild_without_carving(obj):
+    rebuild_civil_mesh(obj, carve=False)
+
+
+def rebuild_civil_mesh(obj, depsgraph=None, carve=True):
     """Main procedural mesh builder triggered whenever parameters or curves change."""
     if not obj or obj.type != 'MESH' or not obj.civil_props.is_civil_object:
         return
@@ -1035,6 +1152,50 @@ def rebuild_civil_mesh(obj, depsgraph=None):
     left_road_edges = [-half_w - left_gore_ext[i] for i in range(num_s)]
     right_road_edges = [half_w + right_gore_ext[i] for i in range(num_s)]
 
+    # Flat strip beside the asphalt that clears sidewalks, barriers, walls and posts.
+    sw = props.sidewalk_width if props.add_sidewalks else 0.0
+    verge = sw + 0.5
+    if props.add_side_barriers:
+        verge = max(verge, sw + 0.4)
+    if props.add_streetlights and props.streetlight_placement != 'MEDIAN':
+        verge = max(verge, sw + 0.8)
+    if props.add_sound_walls:
+        verge = max(verge, sw + 0.45 + props.sound_wall_thickness * 0.5)
+    if props.add_gantry_signs:
+        verge = max(verge, sw + 1.3)
+
+    # Real ground: each stretch of road is on the ground, a bridge, or a tunnel.
+    terrain_obj = props.terrain_object
+    if not (terrain_obj and terrain_obj.type == 'MESH' and terrain_obj != obj):
+        terrain_obj = None
+    ground = terrain.ground_for(terrain_obj) if terrain_obj else None
+    modes = None
+    ground_at = local_ground_z
+    if ground is not None:
+        cen = np.array([tuple(sp[0]) for sp in local_samples])
+        lft = np.array([tuple(sp[0] + sp[3] * left_road_edges[i]) for i, sp in enumerate(local_samples)])
+        rgt = np.array([tuple(sp[0] + sp[3] * right_road_edges[i]) for i, sp in enumerate(local_samples)])
+        gc = terrain.local_heights(obj, ground, cen)
+        if not np.isnan(gc).all():
+            gc = terrain.fill_along(gc, local_ground_z)
+            d_along = np.concatenate([[0.0], np.cumsum(np.linalg.norm(np.diff(cen[:, :2], axis=0), axis=1))])
+            manual = None
+            if props.add_tunnel and total_w > 0.1:
+                ts_u = min(props.tunnel_start, props.tunnel_end - 0.05)
+                te_u = max(props.tunnel_end, ts_u + 0.05)
+                manual = (max(0, int(ts_u * (num_s - 1))), min(num_s - 1, int(te_u * (num_s - 1))))
+            low_edge = np.minimum(lft[:, 2], rgt[:, 2])
+            overrides = [(st.kind, st.center - st.length * 0.5, st.center + st.length * 0.5)
+                         for st in props.structures]
+            modes = terrain.classify(d_along, np.minimum(cen[:, 2], low_edge), gc, props, manual, overrides)
+            # Tunnel stretches with too little ground over them sit in an open cut instead.
+            crown = cen[:, 2] + props.tunnel_height + props.tunnel_wall_thickness + 1.5
+            covered = (modes == terrain.TUNNEL) & (gc >= crown)
+
+            def ground_at(p):
+                h = terrain.local_heights(obj, ground, [tuple(p)])[0]
+                return None if np.isnan(h) else float(h)
+
     # 1. Asphalt Road Surface & Roadbed/Girder Profile
     # Wide faces are split into ~2 m strips: a single full-width quad twists on banked or
     # graded curves, and its triangulation then lets the deck below poke through the asphalt.
@@ -1048,44 +1209,54 @@ def rebuild_civil_mesh(obj, depsgraph=None):
 
         add_variable_extrusion(bm, local_samples, asphalt_prof_fn, mat_index=0, cap_ends=True)
 
-        if props.is_overpass:
-            def girder_prof_fn(i):
-                lx, rx = left_road_edges[i], right_road_edges[i]
-                w_curr = rx - lx
-                g_inset = max(0.4, w_curr * 0.18)
-                return split_profile_edges([
-                    (lx - 0.25, 0.0),
-                    (rx + 0.25, 0.0),
-                    (rx + 0.25, -0.25),
-                    (rx - g_inset, -deck_t),
-                    (lx + g_inset, -deck_t),
-                    (lx - 0.25, -0.25),
-                ], w_splits, (0, 3))
+        def girder_prof_fn(i):
+            lx, rx = left_road_edges[i], right_road_edges[i]
+            w_curr = rx - lx
+            g_inset = max(0.4, w_curr * 0.18)
+            return split_profile_edges([
+                (lx - 0.25, 0.0),
+                (rx + 0.25, 0.0),
+                (rx + 0.25, -0.25),
+                (rx - g_inset, -deck_t),
+                (lx + g_inset, -deck_t),
+                (lx - 0.25, -0.25),
+            ], w_splits, (0, 3))
+
+        def base_prof_fn(i):
+            lx, rx = left_road_edges[i], right_road_edges[i]
+            return split_profile_edges([
+                (lx - 0.15, -deck_t * 0.4),
+                (rx + 0.15, -deck_t * 0.4),
+                (rx + 0.05, 0.0),
+                (lx - 0.05, 0.0),
+            ], w_splits, (0, 2))
+
+        if modes is not None:
+            # Girders under the bridge stretches, a roadbed everywhere else.
+            for kind, a, b in terrain.runs_with_overlap(modes):
+                if b <= a:
+                    continue
+                fn = girder_prof_fn if kind == terrain.BRIDGE else base_prof_fn
+                add_variable_extrusion(bm, local_samples[a:b + 1], lambda k, a=a, fn=fn: fn(a + k),
+                                       mat_index=1, cap_ends=True)
+        elif props.is_overpass:
             add_variable_extrusion(bm, local_samples, girder_prof_fn, mat_index=1, cap_ends=True)
         else:
-            def base_prof_fn(i):
-                lx, rx = left_road_edges[i], right_road_edges[i]
-                return split_profile_edges([
-                    (lx - 0.15, -deck_t * 0.4),
-                    (rx + 0.15, -deck_t * 0.4),
-                    (rx + 0.05, 0.0),
-                    (lx - 0.05, 0.0),
-                ], w_splits, (0, 2))
             add_variable_extrusion(bm, local_samples, base_prof_fn, mat_index=1, cap_ends=True)
 
     # 2. Terrain Cut-and-Fill Embankment Slopes (Berms)
-    if props.add_embankments and not props.is_overpass:
-        # Clear everything built beside the asphalt before the slope starts.
-        sw = props.sidewalk_width if props.add_sidewalks else 0.0
-        verge = sw + 0.5
-        if props.add_side_barriers:
-            verge = max(verge, sw + 0.4)
-        if props.add_streetlights and props.streetlight_placement != 'MEDIAN':
-            verge = max(verge, sw + 0.8)
-        if props.add_sound_walls:
-            verge = max(verge, sw + 0.45 + props.sound_wall_thickness * 0.5)
-        if props.add_gantry_signs:
-            verge = max(verge, sw + 1.3)
+    if props.add_embankments and modes is not None:
+        # Banks down to (fill) or up to (cut) the real ground, wherever the road is on the ground.
+        for kind, a, b in terrain.runs_with_overlap(modes):
+            if kind != terrain.ROAD or b <= a:
+                continue
+            sub = local_samples[a:b + 1]
+            le, re_ = left_road_edges[a:b + 1], right_road_edges[a:b + 1]
+            rings = {-1.0: terrain_slope_rings(obj, ground, sub, le, -1.0, verge),
+                     1.0: terrain_slope_rings(obj, ground, sub, re_, 1.0, verge)}
+            add_embankment_slopes(bm, sub, le, re_, ground_z=local_ground_z, verge_w=verge,
+                                  mat_index=9, terrain_rings=rings)
+    elif props.add_embankments and not props.is_overpass:
         add_embankment_slopes(bm, local_samples, left_road_edges, right_road_edges,
                               ground_z=local_ground_z, verge_w=verge, mat_index=9)
 
@@ -1228,7 +1399,18 @@ def rebuild_civil_mesh(obj, depsgraph=None):
 
     # Determine Tunnel Sample Range
     t_start_idx, t_end_idx = -1, -1
-    if props.add_tunnel and total_w > 0.1:
+    if modes is not None:
+        if total_w > 0.1:
+            for kind, a, b in terrain.runs_with_overlap(modes):
+                if kind == terrain.TUNNEL and b > a:
+                    add_tunnel_section(
+                        bm, local_samples[a:b + 1], left_road_edges[a:b + 1], right_road_edges[a:b + 1],
+                        clearance_h=props.tunnel_height,
+                        wall_t=props.tunnel_wall_thickness,
+                        arched=(props.tunnel_profile == 'ARCHED'),
+                        asphalt_h=asphalt_h
+                    )
+    elif props.add_tunnel and total_w > 0.1:
         ts_u = min(props.tunnel_start, props.tunnel_end - 0.05)
         te_u = max(props.tunnel_end, ts_u + 0.05)
         t_start_idx = max(0, int(ts_u * (num_s - 1)))
@@ -1245,7 +1427,56 @@ def rebuild_civil_mesh(obj, depsgraph=None):
                 asphalt_h=asphalt_h
             )
 
+    # Portals: where a tunnel goes under the hill, a concrete headwall around the opening, and a
+    # matching hole in the terrain so the hillside doesn't hang over the tunnel mouth.
+    portal_holes = []
+    tube_pad = 0.6 + props.tunnel_wall_thickness + 0.7
+    if modes is not None and ground.grid is not None:
+        cell = abs(ground.grid[2])
+        for k in range(num_s - 1):
+            if covered[k] == covered[k + 1]:
+                continue
+            j, o = (k + 1, k) if covered[k + 1] else (k, k + 1)
+            into = 1.0 if j > o else -1.0
+            pos, tang, norm, right = local_samples[j]
+            t_up, r_up, up = flat_frame(tang)
+            axis = t_up * into
+            lx, rx = left_road_edges[j], right_road_edges[j]
+            center = pos + right * ((lx + rx) * 0.5)
+            open_hw = (rx - lx) * 0.5 + tube_pad
+            M = obj.matrix_world
+            wc = M @ center
+            wa = (M.to_3x3() @ axis)
+            wa = Vector((wa.x, wa.y)).normalized()
+            hole = (wc.x, wc.y, wa.x, wa.y, -1.25 * cell - 0.5, 2.0 * cell + 0.5, open_hw + 0.3)
+            ext = terrain.hole_extent(terrain_obj, hole)
+            if ext is None:
+                continue
+            portal_holes.append(hole)
+            a0, a1, lat = ext[0] - 0.3, ext[1] + 0.3, ext[2]
+            half_w = max(lat, open_hw) + 3.0
+            # Up to the hillside over the whole headwall.
+            probe = [center + axis * a + r_up * x for a in np.linspace(a0, a1, 4)
+                     for x in np.linspace(-half_w, half_w, 5)]
+            hs = terrain.local_heights(obj, ground, [tuple(q) for q in probe])
+            top = (np.nanmax(hs) + 0.5) if not np.isnan(hs).all() else center.z + 12.0
+            top = min(top, center.z + 45.0)
+            bottom = center.z - 1.0
+            crown_o = props.tunnel_height + props.tunnel_wall_thickness + 0.7
+            mid = center + axis * ((a0 + a1) * 0.5)
+            half_d = (a1 - a0) * 0.5
+            base = Vector((mid.x, mid.y, bottom))
+            side_hw = (half_w - open_hw) * 0.5
+            for sgn in (-1.0, 1.0):
+                add_box_prism(bm, base + r_up * (sgn * (open_hw + side_hw)), r_up, axis, up,
+                              side_hw, half_d, top - bottom, mat_index=1)
+            if top > center.z + crown_o:
+                add_box_prism(bm, Vector((mid.x, mid.y, center.z + crown_o)), r_up, axis, up,
+                              open_hw, half_d, top - center.z - crown_o, mat_index=1)
+
     def is_inside_tunnel(idx):
+        if modes is not None:
+            return modes[idx] == terrain.TUNNEL
         return props.add_tunnel and (t_start_idx <= idx <= t_end_idx)
 
     # 10. Cable-Stayed Bridge Towers & Cables
@@ -1255,7 +1486,7 @@ def rebuild_civil_mesh(obj, depsgraph=None):
             tower_spacing=props.cable_tower_spacing,
             tower_height=props.cable_tower_height,
             deck_t=deck_t,
-            ground_z=local_ground_z,
+            ground_z=ground_at,
         )
 
     # 11. Highway Toll Booth Plazas
@@ -1365,7 +1596,64 @@ def rebuild_civil_mesh(obj, depsgraph=None):
     # 14. Overpass Support Pillars
     # A support stands at each end of the deck, with the rest spread evenly between them.
     # Cable-stayed bridges hang between their towers, so they only get the two end supports.
-    if props.is_overpass and props.add_pillars:
+    def place_pier(d, cum):
+        j = 0
+        while j < num_s - 2 and cum[j + 1] < d:
+            j += 1
+        seg = max(1e-6, cum[j + 1] - cum[j])
+        f = min(1.0, max(0.0, (d - cum[j]) / seg))
+        p0, t0, n0, r0 = local_samples[j]
+        p1, t1, n1, r1 = local_samples[j + 1]
+        lx = left_road_edges[j] + (left_road_edges[j + 1] - left_road_edges[j]) * f
+        rx = right_road_edges[j] + (right_road_edges[j + 1] - right_road_edges[j]) * f
+        w_curr = rx - lx
+        g_inset = max(0.4, w_curr * 0.18)  # matches the girder profile above
+        soffit_w = w_curr - 2.0 * g_inset
+        style = props.pier_style
+        if style == 'AUTO':
+            style = 'MULTI' if soffit_w > 9.0 else 'HAMMERHEAD'
+        add_pier_bent(bm, p0.lerp(p1, f), r0.lerp(r1, f).normalized(), n0.lerp(n1, f).normalized(),
+                      (lx + rx) * 0.5, soffit_w, deck_t, ground_at,
+                      style, min(props.pillar_width, max(1.0, soffit_w * 0.6)), props.pillar_depth)
+
+    if modes is not None and props.add_pillars:
+        # Each bridge stretch: piers spread along it, abutments where it meets the earth bank.
+        cum = [0.0]
+        for i in range(1, num_s):
+            cum.append(cum[-1] + (local_samples[i][0] - local_samples[i - 1][0]).length)
+        runs = terrain.runs_with_overlap(modes)
+        # Clear span is the free width between pillar faces (footings included).
+        pier_half = props.pillar_depth * 0.5 + 0.9
+        clear_spans = [(float(np.interp(st.center, d_along, cum)), st.clear_span * 0.5 + pier_half)
+                       for st in props.structures if st.kind == 'BRIDGE' and st.clear_span > 0.0]
+        for k, (kind, a, b) in enumerate(runs):
+            if kind != terrain.BRIDGE or b <= a:
+                continue
+            prev_kind = runs[k - 1][0] if k > 0 else None
+            next_kind = runs[k + 1][0] if k + 1 < len(runs) else None
+            d0, d1 = cum[a], cum[b]
+            inset = min(1.5, (d1 - d0) * 0.05)
+            s0 = d0 + (0.0 if prev_kind is not None else inset)
+            s1 = d1 - (0.0 if next_kind is not None else inset)
+            if props.add_cable_bridge and props.is_overpass:
+                ds = [s0, s1]
+            else:
+                n_sp = max(1, round((s1 - s0) / props.pillar_spacing))
+                ds = [s0 + (s1 - s0) * q / n_sp for q in range(n_sp + 1)]
+            if prev_kind is not None:
+                ds = ds[1:]  # the abutment or tunnel portal carries this end
+            if next_kind is not None:
+                ds = ds[:-1]
+            for d in ds:
+                if any(abs(d - c) < half for c, half in clear_spans):
+                    continue  # keep the tracks / road under an overpass clear
+                place_pier(d, cum)
+            if prev_kind == terrain.ROAD:
+                add_abutment(bm, local_samples[a], left_road_edges[a], right_road_edges[a], ground_at, -1.0)
+            if next_kind == terrain.ROAD:
+                add_abutment(bm, local_samples[b], left_road_edges[b], right_road_edges[b], ground_at, 1.0)
+
+    elif props.is_overpass and props.add_pillars:
         cum = [0.0]
         for i in range(1, num_s):
             cum.append(cum[-1] + (local_samples[i][0] - local_samples[i - 1][0]).length)
@@ -1377,28 +1665,8 @@ def rebuild_civil_mesh(obj, depsgraph=None):
         else:
             n_spans = max(1, round(usable / props.pillar_spacing))
             pier_ds = [end_inset + usable * k / n_spans for k in range(n_spans + 1)]
-
-        j = 0
         for d in pier_ds:
-            while j < num_s - 2 and cum[j + 1] < d:
-                j += 1
-            seg = max(1e-6, cum[j + 1] - cum[j])
-            f = min(1.0, max(0.0, (d - cum[j]) / seg))
-            p0, t0, n0, r0 = local_samples[j]
-            p1, t1, n1, r1 = local_samples[j + 1]
-            pos = p0.lerp(p1, f)
-            normal = n0.lerp(n1, f).normalized()
-            right = r0.lerp(r1, f).normalized()
-            lx = left_road_edges[j] + (left_road_edges[j + 1] - left_road_edges[j]) * f
-            rx = right_road_edges[j] + (right_road_edges[j + 1] - right_road_edges[j]) * f
-            w_curr = rx - lx
-            g_inset = max(0.4, w_curr * 0.18)  # matches the girder profile above
-            soffit_w = w_curr - 2.0 * g_inset
-            style = props.pier_style
-            if style == 'AUTO':
-                style = 'MULTI' if soffit_w > 9.0 else 'HAMMERHEAD'
-            add_pier_bent(bm, pos, right, normal, (lx + rx) * 0.5, soffit_w, deck_t, local_ground_z,
-                          style, min(props.pillar_width, max(1.0, soffit_w * 0.6)), props.pillar_depth)
+            place_pier(d, cum)
 
     # Dashed extrusions leave unused ring vertices behind; drop them.
     loose = [v for v in bm.verts if not v.link_faces]
@@ -1416,6 +1684,18 @@ def rebuild_civil_mesh(obj, depsgraph=None):
 
     # Keep the traffic routes that run over this road on it as it changes.
     traffic.update_routes(obj, local_samples, depsgraph)
+
+    # Cut the terrain down where the road passes through it.
+    old_terrain = terrain.carved_by(obj.name)
+    if modes is not None:
+        terrain.record_carve(obj, terrain_obj, local_samples, modes, left_road_edges, right_road_edges,
+                             verge, deck_t, covered=covered, tube_pad=tube_pad + 1.0, holes=portal_holes)
+        if carve:
+            terrain.carve(terrain_obj, rebuild_fn=_rebuild_without_carving)
+    else:
+        terrain.forget_carve(obj.name)
+    if carve and old_terrain and (terrain_obj is None or old_terrain != terrain_obj.name):
+        terrain.carve(bpy.data.objects.get(old_terrain), rebuild_fn=_rebuild_without_carving)
 
 
 # ==============================================================================
@@ -1580,6 +1860,41 @@ class CIVIL_PG_Segment(bpy.types.PropertyGroup):
     )
 
 
+STRUCTURE_KINDS = [
+    ('BRIDGE', "Overpass", "Bridge this stretch, high enough to clear what's underneath (tracks, a road, a creek)",
+     'MOD_ARRAY', 0),
+    ('BANK', "Earth Bank", "Keep this stretch on an earth bank or in a cutting: never a bridge or a tunnel",
+     'MOD_SMOOTH', 1),
+    ('TUNNEL', "Tunnel", "Put this stretch in a tunnel", 'VIEW_PERSPECTIVE', 2),
+]
+STRUCTURE_LENGTH = {'BRIDGE': 40.0, 'BANK': 60.0, 'TUNNEL': 100.0}
+
+
+class CIVIL_PG_Structure(bpy.types.PropertyGroup):
+    """A stretch of road where you decide what gets built, instead of the terrain."""
+    kind: bpy.props.EnumProperty(name="Type", items=STRUCTURE_KINDS, default='BRIDGE', update=update_civil_prop)
+    center: bpy.props.FloatProperty(
+        name="At", default=0.0, min=0.0, max=100000.0, unit='LENGTH',
+        description="Distance along the road, from its start, to the middle of this stretch",
+        update=update_civil_prop
+    )
+    length: bpy.props.FloatProperty(
+        name="Length", default=40.0, min=4.0, max=5000.0, unit='LENGTH',
+        description="How long this stretch is", update=update_civil_prop
+    )
+    clearance: bpy.props.FloatProperty(
+        name="Clearance", default=7.0, min=0.0, max=60.0, unit='LENGTH',
+        description="Free height under the bridge. About 7 m clears a railway, 5 m a road. "
+                    "The road is lifted (within its grade limit) to make room",
+        update=update_civil_prop
+    )
+    clear_span: bpy.props.FloatProperty(
+        name="Clear Span", default=20.0, min=0.0, max=500.0, unit='LENGTH',
+        description="Width in the middle of the bridge kept free of pillars, over the tracks or road below",
+        update=update_civil_prop
+    )
+
+
 class CIVIL_PG_ObjectProps(bpy.types.PropertyGroup):
     is_civil_object: bpy.props.BoolProperty(name="Is Civil Object", default=False)
 
@@ -1664,6 +1979,63 @@ class CIVIL_PG_ObjectProps(bpy.types.PropertyGroup):
     ground_level_z: bpy.props.FloatProperty(
         name="Ground Level Z", default=0.0, min=-100.0, max=100.0, unit='LENGTH',
         description="World Z of the ground plane, used by embankments, overpass piers and bridge towers",
+        update=update_civil_prop
+    )
+
+    # Real-world terrain
+    terrain_object: bpy.props.PointerProperty(
+        name="Terrain", type=bpy.types.Object,
+        poll=lambda self, obj: obj.type == 'MESH' and not obj.civil_props.is_civil_object,
+        description="Ground mesh the road is built on (an imported terrain or any mesh). "
+                    "Piers, banks and tunnels then fit the real ground",
+        update=update_civil_prop
+    )
+    follow_terrain: bpy.props.BoolProperty(
+        name="Follow Terrain", default=True,
+        description="Set the road's height from the ground, smoothed and held to the maximum grade. "
+                    "Off: the guide curve's own height is used",
+        update=update_civil_prop
+    )
+    terrain_offset: bpy.props.FloatProperty(
+        name="Height Above Ground", default=0.3, min=-60.0, max=200.0, unit='LENGTH',
+        description="How far the road sits above the smoothed ground",
+        update=update_civil_prop
+    )
+    max_grade: bpy.props.FloatProperty(
+        name="Max Grade %", default=6.0, min=0.5, max=30.0, precision=1,
+        description="Steepest climb allowed, in percent (6% is typical for highways)",
+        update=update_civil_prop
+    )
+    terrain_smoothing: bpy.props.FloatProperty(
+        name="Smoothing", default=80.0, min=0.0, max=1000.0, unit='LENGTH',
+        description="Length over which bumps in the ground are evened out",
+        update=update_civil_prop
+    )
+    auto_bridges: bpy.props.BoolProperty(
+        name="Auto Bridges", default=True,
+        description="Build a bridge with piers wherever the road is high above the ground",
+        update=update_civil_prop
+    )
+    bridge_min_height: bpy.props.FloatProperty(
+        name="Above", default=7.0, min=1.5, max=100.0, unit='LENGTH',
+        description="Road height above the ground at which an earth bank becomes a bridge",
+        update=update_civil_prop
+    )
+    auto_tunnels: bpy.props.BoolProperty(
+        name="Auto Tunnels", default=True,
+        description="Bore a tunnel wherever the road is deep below the ground",
+        update=update_civil_prop
+    )
+    tunnel_min_depth: bpy.props.FloatProperty(
+        name="Below", default=18.0, min=3.0, max=200.0, unit='LENGTH',
+        description="Depth below the ground at which a cutting becomes a tunnel",
+        update=update_civil_prop
+    )
+    structures: bpy.props.CollectionProperty(type=CIVIL_PG_Structure)
+    active_structure: bpy.props.IntProperty(name="Active Structure", default=0, min=0)
+    shape_terrain: bpy.props.BoolProperty(
+        name="Cut Terrain", default=True,
+        description="Lower the terrain mesh where the road passes through it, so hills don't cover the road",
         update=update_civil_prop
     )
 
@@ -1935,6 +2307,16 @@ class CIVIL_PG_ObjectProps(bpy.types.PropertyGroup):
 # 6. OPERATORS (PRESETS, BUILDERS & INTERCHANGE RAMPS)
 # ==============================================================================
 
+def curve_start_point(curve_obj):
+    """Local position of the curve's first point."""
+    sp = curve_obj.data.splines[0] if curve_obj.data.splines else None
+    if sp is None:
+        return Vector()
+    if sp.type == 'BEZIER':
+        return sp.bezier_points[0].co.copy()
+    return sp.points[0].co.xyz
+
+
 def create_guide_curve(context, name, points_coords):
     """Creates a 3D Bezier curve with auto-handles from a list of (x,y,z) tuples."""
     curve_data = bpy.data.curves.new(name=f"{name}_Curve", type='CURVE')
@@ -1988,6 +2370,8 @@ class CIVIL_OT_CreateRoadPreset(bpy.types.Operator):
     )
 
     PRESET_ELEVATION = {'HIGHWAY': 3.5, 'CABLE_BRIDGE': 12.0, 'OVERPASS': 10.0}
+    # Height above real ground when the road starts on a terrain.
+    TERRAIN_OFFSET = {'CABLE_BRIDGE': 14.0, 'OVERPASS': 10.0}
 
     def execute(self, context):
         if context.mode != 'OBJECT':
@@ -1995,14 +2379,21 @@ class CIVIL_OT_CreateRoadPreset(bpy.types.Operator):
 
         active_obj = context.active_object
         use_segments = not (active_obj and active_obj.type == 'CURVE')
+        elevation_set = self.properties.is_property_set("elevation")
         if not use_segments:
             curve_obj = active_obj
+            start = curve_obj.matrix_world @ curve_start_point(curve_obj)
         else:
-            if not self.properties.is_property_set("elevation"):
+            start = context.scene.cursor.location.copy()
+        on_terrain = terrain.terrain_under(context.scene, start)
+        if use_segments:
+            if not elevation_set:
                 self.elevation = self.PRESET_ELEVATION.get(self.preset_type, 0.0)
             # The road starts at the 3D cursor heading +X; the segment chain gives its shape.
             curve_obj = create_guide_curve(context, self.preset_type.title(), [(0, 0, 0), (1, 0, 0)])
             curve_obj.location = context.scene.cursor.location + Vector((0.0, 0.0, self.elevation))
+            if on_terrain:
+                curve_obj.location.z = on_terrain[1] + 0.3
 
         mesh_data = bpy.data.meshes.new(f"Civil_{self.preset_type.title()}_Mesh")
         road_obj = bpy.data.objects.new(f"Civil_{self.preset_type.title()}", mesh_data)
@@ -2101,6 +2492,15 @@ class CIVIL_OT_CreateRoadPreset(bpy.types.Operator):
             p.add_lane_markings = False
             p.is_overpass = False
 
+        if on_terrain:
+            # Built over real land: follow it, and let the ground decide on banks, bridges and tunnels.
+            p.terrain_object = on_terrain[0]
+            p.follow_terrain = True
+            p.terrain_offset = (self.elevation if elevation_set
+                                else self.TERRAIN_OFFSET.get(self.preset_type, 0.3))
+            p.add_embankments = self.preset_type not in ('BARRIER_WALL',)
+            p.add_toll_plaza = False
+
         p.is_civil_object = True
         if use_segments:
             write_segments_to_curve(curve_obj, p.segments)
@@ -2116,6 +2516,8 @@ class CIVIL_OT_CreateRoadPreset(bpy.types.Operator):
 
 LANE_SETUP_PROPS = ("lanes_left", "lanes_right", "lane_width", "shoulder_width", "median_width",
                     "traffic_speed", "traffic_left_hand")
+TERRAIN_PROPS = ("terrain_object", "follow_terrain", "max_grade", "terrain_smoothing", "auto_bridges",
+                 "bridge_min_height", "auto_tunnels", "tunnel_min_depth", "shape_terrain")
 
 
 class CIVIL_OT_RoadContinue(bpy.types.Operator):
@@ -2173,6 +2575,16 @@ class CIVIL_OT_RoadContinue(bpy.types.Operator):
             if len(p.segments):
                 p.segments[0].rise = self.rise
             p.add_toll_plaza = False  # one plaza per highway is plenty
+            pp = prev.civil_props
+            if pp.terrain_object:
+                for name in TERRAIN_PROPS:
+                    setattr(p, name, getattr(pp, name))
+                p.add_embankments = self.preset_type != 'BARRIER_WALL'
+                lifted = CIVIL_OT_CreateRoadPreset.TERRAIN_OFFSET
+                if self.preset_type in lifted:
+                    p.terrain_offset = lifted[self.preset_type]  # ramps up from the previous road's end
+                else:
+                    p.terrain_offset = pp.terrain_offset if not pp.is_overpass else 0.3
             curve = p.target_curve
             curve.location = end_pos
             curve.rotation_euler = (0.0, 0.0, heading)
@@ -2291,6 +2703,92 @@ class CIVIL_UL_Segments(bpy.types.UIList):
             kind = f"{'Left' if item.bend > 0 else 'Right'} {abs(item.bend):.0f}°"
         row.label(text=f"{index + 1}. {kind}", icon=seg_icon)
         row.label(text=f"{item.length:.0f} m")
+
+
+def road_distance_at(road, world_pt):
+    """(distance along the road, horizontal distance off it) of the road point nearest world_pt."""
+    samples = road_local_samples(road)
+    if len(samples) < 2:
+        return None
+    M = road.matrix_world
+    pts = np.array([tuple(M @ sp[0]) for sp in samples])
+    d = np.concatenate([[0.0], np.cumsum(np.linalg.norm(np.diff(pts[:, :2], axis=0), axis=1))])
+    off = np.hypot(pts[:, 0] - world_pt[0], pts[:, 1] - world_pt[1])
+    i = int(np.argmin(off))
+    return float(d[i]), float(off[i])
+
+
+def active_terrain_road(context):
+    obj = context.active_object
+    if obj and obj.type == 'MESH' and obj.civil_props.is_civil_object and obj.civil_props.target_curve:
+        return obj
+    return None
+
+
+class CIVIL_OT_StructureAdd(bpy.types.Operator):
+    bl_idname = "civil.structure_add"
+    bl_label = "Add Structure at Cursor"
+    bl_description = ("Decide what gets built where the 3D cursor is on this road (Shift+right-click "
+                      "the spot first): an overpass, an earth bank or a tunnel")
+    bl_options = {'REGISTER', 'UNDO'}
+
+    kind: bpy.props.EnumProperty(name="Type", items=STRUCTURE_KINDS, default='BRIDGE')
+
+    @classmethod
+    def poll(cls, context):
+        return active_terrain_road(context) is not None
+
+    def execute(self, context):
+        road = active_terrain_road(context)
+        hit = road_distance_at(road, context.scene.cursor.location)
+        if hit is None:
+            return {'CANCELLED'}
+        at, off = hit
+        if off > 60.0:
+            self.report({'WARNING'}, "Put the 3D cursor on the road first (Shift+right-click the spot)")
+            return {'CANCELLED'}
+        p = road.civil_props
+        p.is_civil_object = False  # one rebuild once it's all set
+        try:
+            st = p.structures.add()
+            st.kind = self.kind
+            st.center = at
+            st.length = STRUCTURE_LENGTH[self.kind]
+            p.active_structure = len(p.structures) - 1
+        finally:
+            p.is_civil_object = True
+        rebuild_civil_mesh(road, depsgraph=context.evaluated_depsgraph_get())
+        self.report({'INFO'}, "%s added %.0f m along the road" % (st.bl_rna.properties["kind"].enum_items[self.kind].name, at))
+        return {'FINISHED'}
+
+
+class CIVIL_OT_StructureRemove(bpy.types.Operator):
+    bl_idname = "civil.structure_remove"
+    bl_label = "Remove Structure"
+    bl_description = "Remove the selected structure; the terrain decides again there"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        road = active_terrain_road(context)
+        return road is not None and len(road.civil_props.structures) > 0
+
+    def execute(self, context):
+        road = active_terrain_road(context)
+        p = road.civil_props
+        idx = min(p.active_structure, len(p.structures) - 1)
+        p.structures.remove(idx)
+        p.active_structure = max(0, min(idx, len(p.structures) - 1))
+        rebuild_civil_mesh(road, depsgraph=context.evaluated_depsgraph_get())
+        return {'FINISHED'}
+
+
+class CIVIL_UL_Structures(bpy.types.UIList):
+    def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index):
+        kind = next(k for k in STRUCTURE_KINDS if k[0] == item.kind)
+        row = layout.row(align=True)
+        row.label(text=kind[1], icon=kind[3])
+        row.label(text=f"at {item.center:.0f} m, {item.length:.0f} m long")
 
 
 class CIVIL_OT_CreateInterchangeRamp(bpy.types.Operator):
@@ -2436,6 +2934,7 @@ class CIVIL_OT_RefreshAll(bpy.types.Operator):
 
     def execute(self, context):
         dg = context.evaluated_depsgraph_get()
+        terrain.clear_cache()
         count = 0
         for obj in bpy.data.objects:
             if obj.type == 'MESH' and obj.civil_props.is_civil_object:
@@ -2475,6 +2974,7 @@ class CIVIL_PT_MainPanel(bpy.types.Panel):
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
     bl_category = 'CivilEng'
+    bl_order = 1
 
     def draw(self, context):
         layout = self.layout
@@ -2540,6 +3040,53 @@ class CIVIL_PT_MainPanel(bpy.types.Panel):
                 r_box.label(text="Shaped by hand on its guide curve", icon='INFO')
             r_box.operator_menu_enum("civil.road_continue", "preset_type", text="New Road From End", icon='FORWARD')
             r_box.prop(props, "attached_to", icon='LINKED')
+
+            # Real ground
+            g_box = layout.box()
+            g_box.label(text="Terrain", icon='WORLD')
+            g_box.prop(props, "terrain_object")
+            if props.terrain_object:
+                g_box.prop(props, "follow_terrain")
+                if props.follow_terrain:
+                    col = g_box.column(align=True)
+                    col.prop(props, "terrain_offset")
+                    col.prop(props, "max_grade")
+                    col.prop(props, "terrain_smoothing")
+                row = g_box.row(align=True)
+                row.prop(props, "auto_bridges")
+                sub = row.row(align=True)
+                sub.enabled = props.auto_bridges and not props.is_overpass
+                sub.prop(props, "bridge_min_height")
+                row = g_box.row(align=True)
+                row.prop(props, "auto_tunnels")
+                sub = row.row(align=True)
+                sub.enabled = props.auto_tunnels
+                sub.prop(props, "tunnel_min_depth")
+                row = g_box.row(align=True)
+                row.prop(props, "add_embankments", text="Earth Banks")
+                row.prop(props, "shape_terrain")
+
+                s_box = g_box.box()
+                s_box.label(text="Your Structures (at the 3D cursor)", icon='PIVOT_CURSOR')
+                row = s_box.row(align=True)
+                for kind_id, label, _d, kind_icon, _n in STRUCTURE_KINDS:
+                    op = row.operator("civil.structure_add", text=label, icon=kind_icon)
+                    op.kind = kind_id
+                if len(props.structures):
+                    row = s_box.row()
+                    row.template_list("CIVIL_UL_Structures", "", props, "structures", props,
+                                      "active_structure", rows=2)
+                    row.operator("civil.structure_remove", icon='REMOVE', text="")
+                    st = props.structures[min(props.active_structure, len(props.structures) - 1)]
+                    col = s_box.column(align=True)
+                    col.prop(st, "kind")
+                    col.prop(st, "center")
+                    col.prop(st, "length")
+                    if st.kind == 'BRIDGE':
+                        col.prop(st, "clearance")
+                        col.prop(st, "clear_span")
+                else:
+                    s_box.label(text="Shift+right-click a spot on the road, then pick one")
 
             # Banking & Superelevation
             t_box = layout.box()
@@ -2710,7 +3257,9 @@ def civil_depsgraph_update_handler(scene, depsgraph):
         if isinstance(update.id, bpy.types.Curve):
             updated_curves.add(update.id.original)
         elif isinstance(update.id, bpy.types.Object) and update.id.type == 'CURVE':
-            updated_curves.add(update.id.original)
+            # Curve objects are also listed when only something that depends on them changed.
+            if update.is_updated_transform or update.is_updated_geometry:
+                updated_curves.add(update.id.original)
 
     if not updated_curves:
         return
@@ -2727,6 +3276,7 @@ def civil_depsgraph_update_handler(scene, depsgraph):
 
 classes = (
     CIVIL_PG_Segment,
+    CIVIL_PG_Structure,
     CIVIL_PG_ObjectProps,
     CIVIL_OT_CreateRoadPreset,
     CIVIL_OT_SegmentAdd,
@@ -2734,6 +3284,9 @@ classes = (
     CIVIL_OT_RoadContinue,
     CIVIL_OT_RoadSnap,
     CIVIL_UL_Segments,
+    CIVIL_OT_StructureAdd,
+    CIVIL_OT_StructureRemove,
+    CIVIL_UL_Structures,
     CIVIL_OT_CreateInterchangeRamp,
     CIVIL_OT_RefreshAll,
     CIVIL_OT_SelectGuideCurve,
@@ -2741,17 +3294,19 @@ classes = (
 )
 
 def register():
-    for cls in classes + traffic.classes:
+    for cls in classes + traffic.classes + terrain.classes:
         bpy.utils.register_class(cls)
     bpy.types.Object.civil_props = bpy.props.PointerProperty(type=CIVIL_PG_ObjectProps)
+    bpy.types.Scene.civil_terrain = bpy.props.PointerProperty(type=terrain.CIVIL_PG_TerrainSettings)
     if civil_depsgraph_update_handler not in bpy.app.handlers.depsgraph_update_post:
         bpy.app.handlers.depsgraph_update_post.append(civil_depsgraph_update_handler)
 
 def unregister():
     if civil_depsgraph_update_handler in bpy.app.handlers.depsgraph_update_post:
         bpy.app.handlers.depsgraph_update_post.remove(civil_depsgraph_update_handler)
+    del bpy.types.Scene.civil_terrain
     del bpy.types.Object.civil_props
-    for cls in reversed(classes + traffic.classes):
+    for cls in reversed(classes + traffic.classes + terrain.classes):
         bpy.utils.unregister_class(cls)
 
 if __name__ == "__main__":
