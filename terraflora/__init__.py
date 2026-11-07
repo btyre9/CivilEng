@@ -12,7 +12,7 @@ CivilFlow roads clear their own space automatically.
 bl_info = {
     "name": "TerraFlora: Forests from Aerial Photos",
     "author": "AI Assistant",
-    "version": (0, 2, 0),
+    "version": (0, 3, 0),
     "blender": (5, 1, 0),
     "location": "View3D > Sidebar > TerraFlora",
     "description": "Grows trees and shrubs where the aerial photo shows them, with paintable clearings.",
@@ -58,6 +58,9 @@ class TF_PG_Forest(bpy.types.PropertyGroup):
     viewport_cards: bpy.props.BoolProperty(
         name="All Cards in Viewport", default=False, update=_sync,
         description="Show every tree as a card while you work, for a fast viewport; renders still use the camera distance")
+    dirt_color: bpy.props.FloatVectorProperty(
+        name="Bare Earth Color", subtype='COLOR', size=3, min=0.0, max=1.0, default=(0.33, 0.085, 0.032),
+        update=_sync, description="Colour of painted bare earth (Georgia red clay to start with)")
     road_clearance: bpy.props.FloatProperty(name="Road Clearance", default=3.0, min=0.0, max=100.0, unit='LENGTH',
                                             update=_sync, description="Distance kept clear around CivilFlow roads")
     seed: bpy.props.IntProperty(name="Seed", default=0, min=0, update=_sync,
@@ -76,11 +79,26 @@ class TF_PG_Forest(bpy.types.PropertyGroup):
                                         description="Width of the cone kept around the camera's view, in degrees")
 
 
+def _views(context):
+    for window in (context.window_manager.windows if context and context.window_manager else []):
+        for area in window.screen.areas:
+            if area.type == 'VIEW_3D':
+                yield area.spaces.active
+
+
+def _apply_overlay(self, context):
+    for sp in _views(context):
+        sp.overlay.weight_paint_mode_opacity = self.paint_overlay
+
+
 class TF_PG_Scene(bpy.types.PropertyGroup):
     terrain: bpy.props.PointerProperty(
         type=bpy.types.Object, name="Terrain",
         poll=lambda self, ob: ob.type == 'MESH' and bool(ob.get("cf_terrain")),
         description="CivilFlow terrain to grow on")
+    paint_overlay: bpy.props.FloatProperty(
+        name="Paint Colors", default=0.35, min=0.0, max=1.0, subtype='FACTOR', update=_apply_overlay,
+        description="How strongly the paint colours cover the photo while painting (lower shows more photo)")
 
 
 def scene_terrain(context):
@@ -204,6 +222,11 @@ class TF_OT_Paint(bpy.types.Operator):
             context.tool_settings.weight_paint.unified_paint_settings.weight = 1.0
         except AttributeError:
             pass
+        # See the photo through the paint colours.
+        for sp in _views(context):
+            sp.overlay.weight_paint_mode_opacity = context.scene.terraflora.paint_overlay
+            if sp.shading.type == 'SOLID':
+                sp.shading.color_type = 'TEXTURE'  # the photo (not the cover map or plain grey)
         self.report({'INFO'}, "%s: paint on the terrain. Hold Ctrl to erase. Done Painting when finished"
                     % forest.PAINT_LAYERS[self.layer][1])
         return {'FINISHED'}
@@ -217,6 +240,10 @@ class TF_OT_PaintDone(bpy.types.Operator):
     def execute(self, context):
         if context.mode != 'OBJECT':
             bpy.ops.object.mode_set(mode='OBJECT')
+        terrain = scene_terrain(context)
+        f = forest.find_forest(terrain) if terrain else None
+        if f is not None and f.hide_viewport:
+            f.hide_viewport = False  # plants hidden while painting come back
         return {'FINISHED'}
 
 
@@ -312,11 +339,18 @@ class TF_PT_Main(bpy.types.Panel):
             vg = terrain.vertex_groups.active
             box.label(text="Painting: %s" % (vg.name.replace("TF ", "") if vg else "?"), icon='BRUSH_DATA')
             box.label(text="Hold Ctrl to erase · F to resize the brush")
+            box.prop(s, "paint_overlay", slider=True)
+            f = forest.find_forest(terrain)
+            if f is not None:
+                box.prop(f, "hide_viewport", text="Hide Plants", toggle=True, icon='HIDE_OFF')
             box.operator("terraflora.paint_done", icon='CHECKMARK')
         grid = box.grid_flow(columns=2, align=True)
         for key, (name, label, desc, icon) in forest.PAINT_LAYERS.items():
             op = grid.operator("terraflora.paint", text=label, icon=icon)
             op.layer = key
+        f = forest.find_forest(terrain)
+        if f is not None:
+            box.prop(f.terraflora, "dirt_color")
         box.operator("terraflora.clear_paint", icon='LOOP_BACK')
 
 

@@ -1,7 +1,7 @@
 schema_version = "1.0.0"
 
 id = "terraflora"
-version = "0.2.0"
+version = "0.3.0"
 name = "TerraFlora: Forests from Aerial Photos"
 tagline = "Trees, grass and clearings grown from real aerial photos"
 maintainer = "AI Assistant"

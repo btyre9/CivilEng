@@ -16,6 +16,7 @@ import math
 import importlib.util
 
 import bpy
+import mathutils
 from mathutils import Vector
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -391,6 +392,377 @@ def terrain_tests(mod, failures):
                f"{name}: {len(obj.data.vertices)} verts, height at a test point {h:.2f} m (want {want:.2f})")
 
 
+def junction_tests(mod, failures):
+    """Intersections: finding them, trimming the roads, devices, signal cycle, following edits, terrain."""
+    import numpy as np
+    J = sys.modules["civilflow.junctions"]
+    T = sys.modules["civilflow.terrain"]
+
+    def report(name, ok, msg):
+        print(f"[{'OK ' if ok else 'BAD'}] {name:13s} {msg}")
+        if not ok:
+            failures.append(name)
+
+    def road(name, pts, preset='STREET', terrain=False):
+        c = mod.create_guide_curve(bpy.context, name, pts)
+        for o in bpy.context.selected_objects:
+            o.select_set(False)
+        c.select_set(True)
+        bpy.context.view_layer.objects.active = c
+        bpy.ops.civil.create_road_preset(preset_type=preset)
+        r = bpy.context.active_object
+        if not terrain:
+            r.civil_props.follow_terrain = False
+        return r, c
+
+    def faces_near(ob, xy, rad, mats=None):
+        M = ob.matrix_world
+        n = 0
+        for pg in ob.data.polygons:
+            c = M @ pg.center
+            if math.hypot(c.x - xy[0], c.y - xy[1]) < rad and (mats is None or pg.material_index in mats):
+                n += 1
+        return n
+
+    clear_scene()
+    for k in ("cf_geo",):
+        if k in bpy.context.scene:
+            del bpy.context.scene[k]
+    a, ca = road("JA", [(-150.0, 0.0, 0.0), (0.0, 0.0, 0.0), (150.0, 0.0, 0.0)])
+    b, cb = road("JB", [(0.0, -150.0, 0.0), (0.0, 0.0, 0.0), (0.0, 150.0, 0.0)])
+    t, ct = road("JT", [(-90.0, 100.0, 0.0), (-90.0, 50.0, 0.0), (-90.0, 0.0, 0.0)])
+    o, co_ = road("JO", [(60.0, -150.0, 0.0), (60.0, 0.0, 0.0), (60.0, 150.0, 0.0)], preset='OVERPASS')
+    before = faces_near(a, (0.0, 0.0), 3.0)
+    bpy.ops.civil.find_junctions()
+    js = [ob for ob in bpy.context.scene.objects if J.is_junction(ob)]
+    shapes = sorted(ob.civil_junction.shape for ob in js)
+    cross = next((ob for ob in js if ob.civil_junction.shape == 'CROSS'), None)
+    tee = next((ob for ob in js if ob.civil_junction.shape == 'T'), None)
+    report("JUNCTION FIND", shapes == ['CROSS', 'T'] and tee is not None and tee.civil_junction.road_b == t,
+           f"found {shapes} (the overpass crossing above is left alone); T ends road {tee.civil_junction.road_b.name if tee else '-'}")
+
+    left = faces_near(a, (0.0, 0.0), 6.0) + faces_near(b, (0.0, 0.0), 6.0)
+    pad = faces_near(cross, (0.0, 0.0), 6.0, mats={0})
+    walks = faces_near(cross, (0.0, 0.0), 30.0, mats={5})
+    lamps = sum(1 for pg in cross.data.polygons if pg.material_index >= J.M_SIGNAL0)
+    report("JUNCTION TRIM", before > 0 and left == 0 and pad > 0 and walks >= 16 and lamps >= 24,
+           f"road faces at the centre {before} -> {left}; pad faces {pad}, crosswalk/stop bars {walks}, lamp faces {lamps}")
+
+    # Signals: each road's green, then yellow, then red; never both green.
+    fps = bpy.context.scene.render.fps
+    p = cross.civil_junction
+    def lit(frame):
+        bpy.context.scene.frame_set(frame)
+        dg = bpy.context.evaluated_depsgraph_get()
+        out = []
+        for m in cross.data.materials[J.M_SIGNAL0:J.M_SIGNAL0 + 6]:
+            me = m.evaluated_get(dg)
+            bsdf = next(n for n in me.node_tree.nodes if n.type == 'BSDF_PRINCIPLED')
+            out.append(bsdf.inputs["Emission Strength"].default_value > 1.0)
+        return out  # R1 Y1 G1 R2 Y2 G2
+    cyc = 2 * (p.green_time + p.yellow_time + p.all_red_time)
+    states = [lit(int(fps * s) + 1) for s in np.arange(0.5, cyc, 1.0)]
+    one_each = all(sum(st[0:3]) == 1 and sum(st[3:6]) == 1 for st in states)
+    never_both = not any(st[2] and st[5] for st in states)
+    greens = (sum(st[2] for st in states), sum(st[5] for st in states))
+    bpy.context.scene.frame_set(1)
+    report("SIGNAL CYCLE", one_each and never_both and min(greens) >= p.green_time - 1,
+           f"one lamp per head always={one_each}, never both green={never_both}, seconds of green {greens}")
+
+    p.control = 'ALL_STOP'
+    octs = sum(1 for pg in cross.data.polygons if pg.material_index == J.M_RED and len(pg.vertices) == 8)
+    p.control = 'ROUNDABOUT'
+    grass = sum(1 for pg in cross.data.polygons if pg.material_index == J.M_GRASS)
+    tris = sum(1 for pg in cross.data.polygons if pg.material_index == J.M_RED and len(pg.vertices) == 3)
+    still = faces_near(a, (0.0, 0.0), 14.0) + faces_near(b, (0.0, 0.0), 14.0)
+    report("JUNCTION TYPES", octs == 4 and grass >= 1 and tris == 4 and still == 0,
+           f"all-way stop signs {octs}, roundabout island {grass > 0}, yield signs {tris}, road faces inside the ring {still}")
+    p.control = 'SIGNALS'
+
+    # Editing a road: the intersection follows it.
+    cb.location.x += 6.0
+    bpy.context.view_layer.update()
+    at = cross["cf_at"]
+    moved = faces_near(b, (6.0, 0.0), 5.0)
+    report("JUNCTION EDIT", abs(at[0] - 6.0) < 0.5 and abs(at[1]) < 0.5 and moved == 0,
+           f"road moved 6 m: intersection now at ({at[0]:.1f}, {at[1]:.1f}), road faces at its centre {moved}")
+
+    bpy.context.view_layer.objects.active = cross
+    bpy.ops.civil.remove_junction()
+    back = faces_near(a, (6.0, 0.0), 3.0)
+    report("JUNCTION REMOVE", back > 0, f"road surface back at the crossing: {back} faces")
+
+    # On terrain: the ground comes down under the pad's corners.
+    clear_scene()
+    for k in ("cf_geo",):
+        if k in bpy.context.scene:
+            del bpy.context.scene[k]
+    x = np.arange(-200.0, 200.0 + 1e-6, 2.0)
+    y = np.arange(-200.0, 200.0 + 1e-6, 2.0)
+    X, Y = np.meshgrid(x, y)
+    ter = T.build_terrain(bpy.context, "Terrain_J", 600000.0 + x, 3600000.0 + y, 50.0 + 0.04 * X + 0.03 * Y, 11, True)
+    bpy.context.scene.cursor.location = (-150.0, 0.0, 0.0)
+    a2, _ = road("TA", [(-150.0, 0.0, 0.0), (0.0, 0.0, 0.0), (150.0, 0.0, 0.0)], terrain=True)
+    b2, _ = road("TB", [(0.0, -150.0, 0.0), (0.0, 0.0, 0.0), (0.0, 150.0, 0.0)], terrain=True)
+    a2.civil_props.terrain_object = ter
+    b2.civil_props.terrain_object = ter
+    bpy.ops.civil.find_junctions()
+    j2 = next((ob for ob in bpy.context.scene.objects if J.is_junction(ob)), None)
+    ok = j2 is not None and len(j2.get("cf_cut", [])) > 0
+    if ok:
+        bpy.ops.civil.refresh_all()
+        # Ray down through the pad's asphalt top at many points: the terrain must be below it.
+        from mathutils.bvhtree import BVHTree
+        dg = bpy.context.evaluated_depsgraph_get()
+        tb = BVHTree.FromObject(ter.evaluated_get(dg), dg)
+        pad_tris = [pg for pg in j2.data.polygons if pg.material_index == 0 and pg.normal.z > 0.9]
+        worst = -9.0
+        for pg in pad_tris:
+            c = pg.center
+            hit = tb.ray_cast(c + mathutils.Vector((0.0, 0.0, 30.0)), mathutils.Vector((0.0, 0.0, -1.0)))
+            if hit[0] is not None:
+                worst = max(worst, hit[0].z - c.z)
+        ok = len(pad_tris) > 0 and worst < 0.0
+        msg = f"{len(pad_tris)} pad faces; terrain at most {worst:.2f} m relative to the asphalt on top (must be below)"
+    else:
+        msg = "no intersection found on terrain"
+    report("JUNCTION GROUND", ok, msg)
+
+
+def traffic_sim_tests(mod, failures):
+    """Traffic through intersections: no overlaps, nobody on red, full stops at stop signs, turns."""
+    import numpy as np
+    from bpy_extras import anim_utils
+    J = sys.modules["civilflow.junctions"]
+    S = sys.modules["civilflow.sim"]
+
+    def report(name, ok, msg):
+        print(f"[{'OK ' if ok else 'BAD'}] {name:13s} {msg}")
+        if not ok:
+            failures.append(name)
+
+    def road(name, pts):
+        c = mod.create_guide_curve(bpy.context, name, pts)
+        for o in bpy.context.selected_objects:
+            o.select_set(False)
+        c.select_set(True)
+        bpy.context.view_layer.objects.active = c
+        bpy.ops.civil.create_road_preset(preset_type='STREET')
+        r = bpy.context.active_object
+        r.civil_props.follow_terrain = False
+        return r
+
+    def tracks(col):
+        vs = [o for o in col.objects if o.get("cf_kind")]
+        out = []
+        for o in vs:
+            ad = o.animation_data
+            cb = anim_utils.action_get_channelbag_for_slot(ad.action, ad.action_slot)
+            xyz = {}
+            for fc in cb.fcurves:
+                if fc.data_path == "location":
+                    co = np.empty(len(fc.keyframe_points) * 2)
+                    fc.keyframe_points.foreach_get("co", co)
+                    xyz[fc.array_index] = co[1::2]
+            out.append(np.stack([xyz[0], xyz[1], xyz[2]], axis=1))
+        return vs, np.array(out)
+
+    for control in ('SIGNALS', 'ALL_STOP', 'ROUNDABOUT'):
+        clear_scene()
+        bpy.context.scene.frame_start, bpy.context.scene.frame_end = 1, 250
+        a = road("SA", [(-200.0, 0.0, 0.0), (0.0, 0.0, 0.0), (200.0, 0.0, 0.0)])
+        b = road("SB", [(0.0, -200.0, 0.0), (0.0, 0.0, 0.0), (0.0, 200.0, 0.0)])
+        bpy.ops.civil.find_junctions()
+        j = next(o for o in bpy.context.scene.objects if J.is_junction(o))
+        j.civil_junction.control = control
+        a.civil_props.traffic_duration = 45.0
+        bpy.context.view_layer.objects.active = a
+        bpy.ops.civil.traffic_generate()
+        col = a.civil_props.traffic_collection
+        vs, T = tracks(col)
+        fps = bpy.context.scene.render.fps
+        vis = T[:, :, 2] > -100.0
+        worst = 99.0
+        for k in range(0, T.shape[1], 2):
+            idx = np.nonzero(vis[:, k])[0]
+            if len(idx) < 2:
+                continue
+            P = T[idx, k, :2]
+            D = np.hypot(P[:, None, 0] - P[None, :, 0], P[:, None, 1] - P[None, :, 1])
+            np.fill_diagonal(D, 99.0)
+            worst = min(worst, float(D.min()))
+        spd = np.linalg.norm(np.diff(T[:, :, :2], axis=1), axis=2) * fps
+        ok_v = vis[:, 1:] & vis[:, :-1] & (spd < 60.0)
+        moving = float(np.mean(spd[ok_v])) if ok_v.any() else 0.0
+        # Each pass through the intersection: where the vehicle came from and went.
+        r_zone = 9.0 if control != 'ROUNDABOUT' else 20.0
+        zone = (np.hypot(T[:, :, 0], T[:, :, 1]) < r_zone) & vis
+        p = j.civil_junction
+        bad, entries, turns, rolled = 0, 0, 0, 0
+        for vi in range(len(vs)):
+            z = zone[vi]
+            k = 1
+            while k < len(z):
+                if z[k] and not z[k - 1]:
+                    k_in = k
+                    while k < len(z) and z[k]:
+                        k += 1
+                    if k >= len(z):
+                        break  # still inside at the end
+                    entries += 1
+                    a_in, a_out = T[vi, k_in - 1, :2], T[vi, k, :2]
+                    if (abs(a_in[0]) > abs(a_in[1])) != (abs(a_out[0]) > abs(a_out[1])):
+                        turns += 1
+                    group = 0 if abs(a_in[0]) > abs(a_in[1]) else 1
+                    if control == 'SIGNALS':
+                        light = S._signal({"G": p.green_time, "Y": p.yellow_time, "AR": p.all_red_time},
+                                          group, (bpy.context.scene.frame_start + k_in) / fps)
+                        bad += light == 'R'
+                    if control == 'ALL_STOP' and k_in > 6 * fps:
+                        window = spd[vi, k_in - 6 * fps:k_in][ok_v[vi, k_in - 6 * fps:k_in]]
+                        rolled += not (len(window) and window.min() < 0.5)
+                k += 1
+        ok = (len(vs) > 10 and worst > 2.5 and moving > 1.5 and entries > 5 and turns > 0
+              and bad == 0 and rolled == 0)
+        report("TRAFFIC " + control[:8], ok,
+               f"{len(vs)} vehicles over {T.shape[1] / fps:.0f} s: closest {worst:.1f} m, mean speed {moving:.1f} m/s, "
+               f"{entries} through the middle ({turns} turning)"
+               + (f", {bad} on red" if control == 'SIGNALS' else "")
+               + (f", {rolled} without stopping" if control == 'ALL_STOP' else ""))
+
+
+def lines_tests(mod, failures):
+    """Streetlight styles and sides, one-sided sign arms, power lines and path lights."""
+    import numpy as np
+    U = sys.modules["civilflow.utilities"]
+    T = sys.modules["civilflow.terrain"]
+
+    def report(name, ok, msg):
+        print(f"[{'OK ' if ok else 'BAD'}] {name:13s} {msg}")
+        if not ok:
+            failures.append(name)
+
+    def centers(ob, mat):
+        me = ob.data
+        return np.array([tuple(ob.matrix_world @ p.center) for p in me.polygons if p.material_index == mat])
+
+    # Each streetlight style on a street, lights on the right side only.
+    clear_scene()
+    for k in ("cf_geo",):
+        if k in bpy.context.scene:
+            del bpy.context.scene[k]
+    bpy.context.scene.cursor.location = (0.0, 0.0, 0.0)
+    bpy.ops.civil.create_road_preset(preset_type='STREET', length=120.0)
+    road = bpy.context.active_object
+    p = road.civil_props
+    p.follow_terrain = False
+    smp = mod.road_local_samples(road)
+    mid = smp[len(smp) // 2]
+    right_w = road.matrix_world.to_3x3() @ mid[3]
+    origin = road.matrix_world @ mid[0]
+    msgs, ok = [], True
+    for style, *_r in U.LIGHT_STYLES:
+        p.streetlight_style = style
+        for side in ('RIGHT', 'LEFT'):
+            p.streetlight_placement = side
+            glow = 13 if style in ('ACORN', 'TWIN', 'LANTERN') else 7
+            c = centers(road, glow)
+            if not len(c):
+                ok = False
+                msgs.append(f"{style}: no lamps")
+                continue
+            sd = (c - np.array(origin)) @ np.array(right_w)
+            want = 1.0 if side == 'RIGHT' else -1.0
+            if not np.all(sd * want > 2.0):
+                ok = False
+                msgs.append(f"{style} {side}: lamps on the wrong side")
+        h_want = U.LIGHT_DEFAULTS[style][0]
+        if abs(p.streetlight_height - h_want) > 1e-6:
+            ok = False
+            msgs.append(f"{style}: height {p.streetlight_height} not {h_want}")
+    report("LIGHT STYLES", ok, "; ".join(msgs) or f"{len(U.LIGHT_STYLES)} styles, each on the right only and the left only")
+
+    # One-sided overhead sign arm.
+    clear_scene()
+    bpy.ops.civil.create_road_preset(preset_type='HIGHWAY', length=300.0)
+    hw = bpy.context.active_object
+    hp = hw.civil_props
+    hp.follow_terrain = False
+    hp.add_gantry_signs = True
+    hp.gantry_style = 'CANTILEVER'
+    smp = mod.road_local_samples(hw)
+    mid = smp[len(smp) // 2]
+    right_w = hw.matrix_world.to_3x3() @ mid[3]
+    origin = np.array(hw.matrix_world @ mid[0])
+    res = {}
+    for side in ('BOTH', 'RIGHT', 'LEFT'):
+        hp.gantry_side = side
+        c = centers(hw, 8)
+        sd = (c - origin) @ np.array(right_w) if len(c) else np.zeros(0)
+        res[side] = (int((sd > 0).sum()), int((sd < 0).sum()))
+    ok = (res['BOTH'][0] > 0 and res['BOTH'][1] > 0 and res['RIGHT'][0] > 0 and res['RIGHT'][1] == 0
+          and res['LEFT'][1] > 0 and res['LEFT'][0] == 0)
+    report("SIGN ARM SIDE", ok, f"sign faces right/left: both {res['BOTH']}, right only {res['RIGHT']}, left only {res['LEFT']}")
+
+    # Power lines: every style along a curve over terrain, poles standing on the ground.
+    clear_scene()
+    for k in ("cf_geo",):
+        if k in bpy.context.scene:
+            del bpy.context.scene[k]
+    x = np.arange(-400.0, 400.0 + 1e-6, 4.0)
+    y = np.arange(-200.0, 200.0 + 1e-6, 4.0)
+    X, Y = np.meshgrid(x, y)
+    ter = T.build_terrain(bpy.context, "Terrain_Lines", 500000.0 + x, 3700000.0 + y,
+                          100.0 + 20.0 * np.sin(X / 90.0) + 0.03 * Y, 11, True)
+    g = T.ground_for(ter)
+    msgs, ok = [], True
+    for k, (style, *_r) in enumerate(U.POWER_STYLES):
+        yy = -150.0 + 75.0 * k
+        curve = mod.create_guide_curve(bpy.context, style, [(-380.0, yy, 0.0), (0.0, yy + 20.0, 0.0), (380.0, yy, 0.0)])
+        for o in bpy.context.selected_objects:
+            o.select_set(False)
+        curve.select_set(True)
+        bpy.context.view_layer.objects.active = curve
+        bpy.ops.civil.add_line(kind='POWER')
+        line = bpy.context.active_object
+        lp = line.civil_line
+        lp.style = style
+        n_poles = line.get("cf_poles", 0)
+        co = np.array([tuple(v.co) for v in line.data.vertices])
+        mats = {pg.material_index for pg in line.data.polygons}
+        span_ok = abs(lp.span - U.POWER_DEFAULTS[style][0]) < 1e-6
+        # Every pole's foot sits in the ground: the lowest points near each pole are below it.
+        low = co[:, 2] - g.world_heights(co[:, 0], co[:, 1])
+        wires = U.M_WIRE in mats
+        cans = U.M_CAN in mats if style == 'WOOD' else True
+        if not (n_poles >= 2 and span_ok and wires and cans and np.nanmin(low) < -0.3 and np.nanmax(low) > 0.95 * lp.pole_height):
+            ok = False
+            msgs.append(f"{style}: poles {n_poles}, wires {wires}, transformers {cans}, "
+                        f"heights {np.nanmin(low):.1f}..{np.nanmax(low):.1f} m")
+        else:
+            msgs.append(f"{style} {n_poles}")
+    report("POWER LINES", ok, "poles per style: " + ", ".join(msgs))
+
+    # Moving the curve moves the line.
+    before = np.array([tuple(v.co) for v in line.data.vertices]).mean(axis=0)
+    curve.location.y += 10.0
+    bpy.context.view_layer.update()
+    after = np.array([tuple(v.co) for v in line.data.vertices]).mean(axis=0)
+    report("LINE FOLLOWS", abs((after - before)[1] - 10.0) < 0.5, f"curve moved 10 m, line moved {(after - before)[1]:.2f} m")
+
+    # Path lights on one side of a path.
+    curve = mod.create_guide_curve(bpy.context, "Park", [(-60.0, 0.0, 0.0), (0.0, 30.0, 0.0), (60.0, 0.0, 0.0)])
+    pl = U.add_line(bpy.context, 'LIGHTS', curve)
+    pl.civil_line.light_side = 'LEFT'
+    c = centers(pl, 13)
+    pts = sys.modules["civilflow.utilities"].curve_points(curve)
+    P = np.array([tuple(q) for q in pts])
+    # Left of a path heading +x that bends up through y=30: the lamps sit north of the curve.
+    nearest = np.array([P[np.argmin(np.hypot(P[:, 0] - q[0], P[:, 1] - q[1]))] for q in c])
+    ok = len(c) > 0 and pl.get("cf_poles", 0) >= 5 and bool(np.all(c[:, 1] > nearest[:, 1] - 0.05))
+    report("PATH LIGHTS", ok, f"{pl.get('cf_poles', 0)} acorn lights, all on the left={ok}")
+
+
 def main():
     mod = load_addon()
     rna = bpy.ops.civil.create_road_preset.get_rna_type()
@@ -723,6 +1095,9 @@ def main():
         failures.append("TILT")
 
     terrain_tests(mod, failures)
+    lines_tests(mod, failures)
+    junction_tests(mod, failures)
+    traffic_sim_tests(mod, failures)
 
     mod.unregister()
     if failures:

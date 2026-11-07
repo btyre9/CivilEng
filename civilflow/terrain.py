@@ -521,6 +521,33 @@ def _road_carves(road, terrain_obj):
     return (road.type == 'MESH' and p.is_civil_object and p.shape_terrain and p.terrain_object == terrain_obj)
 
 
+_AREAS = {}
+
+
+def record_area(name, terrain_obj, poly_xy, z):
+    """An area (an intersection) the terrain is cut down to: world outline and the height at each of
+    its points (a list), or one height for all."""
+    poly = np.array(poly_xy, dtype=np.float64)
+    zs = np.full(len(poly), float(z)) if np.ndim(z) == 0 else np.array(z, dtype=np.float64)
+    _AREAS[name] = {"terrain": terrain_obj.name, "poly": poly, "z": zs}
+
+
+def forget_area(name):
+    _AREAS.pop(name, None)
+
+
+def _in_poly(px, py, X, Y):
+    inside = np.zeros(X.shape, dtype=bool)
+    for k in range(len(px)):
+        a, b = px[k], py[k]
+        c, d = px[(k + 1) % len(px)], py[(k + 1) % len(py)]
+        cond = (b > Y) != (d > Y)
+        with np.errstate(divide='ignore', invalid='ignore'):
+            xi = a + (Y - b) * (c - a) / (d - b)
+        inside ^= cond & (X < xi)
+    return inside
+
+
 def _hole_mask(g, holes):
     """Faces (ny-1, nx-1) whose centre lies inside any portal opening."""
     x0, y0, dx, dy, nx, ny = g.grid
@@ -672,6 +699,46 @@ def carve(terrain_obj, rebuild_fn=None):
             env = np.where((np.abs(along) <= half_slab) & (over <= MAX_CUT * sl), env, np.inf)
             sub = Z[j0:j1, i0:i1]
             np.minimum(sub, env, out=sub)
+
+    # Intersections: the ground under each pad (and its corners) comes down to it.
+    for name, rec in list(_AREAS.items()):
+        if rec["terrain"] != terrain_obj.name or bpy.data.objects.get(name) is None:
+            continue
+        poly = rec["poly"]
+        px = mi[0, 0] * poly[:, 0] + mi[0, 1] * poly[:, 1] + mi[0, 3]
+        py = mi[1, 0] * poly[:, 0] + mi[1, 1] * poly[:, 1] + mi[1, 3]
+        pz = mi[2, 0] * poly[:, 0] + mi[2, 1] * poly[:, 1] + mi[2, 2] * rec["z"] + mi[2, 3]
+        reach = 25.0
+        i0 = max(0, int((px.min() - reach - x0) / dx))
+        i1 = min(nx, int((px.max() + reach - x0) / dx) + 2)
+        j0 = max(0, int((py.min() - reach - y0) / dy))
+        j1 = min(ny, int((py.max() + reach - y0) / dy) + 2)
+        if i1 <= i0 or j1 <= j0:
+            continue
+        GX, GY = np.meshgrid(xs[i0:i1], ys[j0:j1])
+        inside = _in_poly(px, py, GX, GY)
+        # Distance to the outline, and its height there, from points along it every metre or so.
+        bx, by, bz = [], [], []
+        for k in range(len(px)):
+            k2 = (k + 1) % len(px)
+            m = max(1, int(math.hypot(px[k2] - px[k], py[k2] - py[k])))
+            t = np.arange(m) / m
+            bx.append(px[k] + (px[k2] - px[k]) * t)
+            by.append(py[k] + (py[k2] - py[k]) * t)
+            bz.append(pz[k] + (pz[k2] - pz[k]) * t)
+        bx, by, bz = np.concatenate(bx), np.concatenate(by), np.concatenate(bz)
+        dist = np.full(GX.shape, np.inf)
+        zb = np.zeros(GX.shape)
+        for k in range(0, len(bx), 256):
+            dd = np.hypot(GX[..., None] - bx[k:k + 256], GY[..., None] - by[k:k + 256])
+            idx = np.argmin(dd, axis=-1)
+            dmin = np.take_along_axis(dd, idx[..., None], axis=-1)[..., 0]
+            closer = dmin < dist
+            zb = np.where(closer, bz[k:k + 256][idx], zb)
+            dist = np.minimum(dist, dmin)
+        env = np.where(inside, zb - 0.05, zb - 0.05 + dist / SLOPE_CUT)
+        sub = Z[j0:j1, i0:i1]
+        np.minimum(sub, env, out=sub)
 
     _write_holes(terrain_obj, _hole_mask(g, holes))
     me = terrain_obj.data

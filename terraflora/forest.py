@@ -12,16 +12,21 @@ Poisson-disk sampling, kept clear of roads (anything in the TerraFlora Clearing 
 measured on the map so bridges and banks clear too), optionally culled to what the camera sees,
 and placed as instances (shared meshes), so even 100,000 trees stay light.
 
+Bare earth: where you paint it, the terrain is covered with a dirt surface (finely divided, with a
+ragged natural edge) and nothing grows.
+
 Level of detail: trees and shrubs farther than Card Distance from the camera are drawn as cards
 (pictures of the same model, 6 triangles); grass tufts only grow within Grass Distance of it.
 """
+
+import math
 
 import bpy
 
 from . import assets
 
 NODE_GROUP = "TF_Forest"
-NODE_VERSION = 3
+NODE_VERSION = 6
 CLEARING = "TerraFlora Clearing"
 MOD_NAME = "TerraFlora"
 
@@ -32,7 +37,10 @@ PAINT_LAYERS = {
     'SHRUBS': ("TF Add Shrubs", "Add Shrubs", "Plant shrubs where you paint", 'SEQ_HISTOGRAM'),
     'GRASS': ("TF Add Grass", "Add Grass", "Grow grass tufts where you paint", 'STROKE'),
     'NO_GRASS': ("TF Remove Grass", "Remove Grass", "Clear grass tufts where you paint", 'PANEL_CLOSE'),
+    'DIRT': ("TF Bare Earth", "Bare Earth", "Paint fresh bare dirt, like a construction site; plants clear out", 'MOD_DISPLACE'),
 }
+DIRT_MATERIAL = "TF Bare Earth"
+DIRT_LIFT = 0.08        # the dirt sits just above the ground so it never flickers through it
 GRASS_CLEARANCE = 0.6   # grass grows right up to the road shoulder
 
 INPUTS = [
@@ -62,6 +70,8 @@ INPUTS = [
     ("Card Distance", 'NodeSocketFloat', 300.0, 0.0, 50000.0, "Trees farther than this from the camera are cards"),
     ("Viewport Cards", 'NodeSocketBool', False, None, None, "Every tree is a card in the viewport"),
     ("Grass Distance", 'NodeSocketFloat', 200.0, 1.0, 50000.0, "Grass grows only this close to the camera"),
+    ("Bare Earth Material", 'NodeSocketMaterial', None, None, None, ""),
+    ("Bare Earth Detail", 'NodeSocketInt', 2, 0, 4, "Subdivisions of each terrain cell for the dirt's edge"),
 ]
 
 
@@ -185,7 +195,9 @@ def build_node_group():
     cos_half = b.math('COSINE', half_angle, x=-1300, y=-950)
 
     water = b.attr("tf_water", -1500, 750)
-    dry = b.math('SUBTRACT', 1.0, water, -1300, 750)
+    dirt = b.attr("TF Bare Earth", -1700, 600)
+    dry = b.math('MULTIPLY', b.math('SUBTRACT', 1.0, water, -1500, 750),
+                 b.math('SUBTRACT', 1.0, dirt, -1500, 600), -1300, 750)
     rem_trees = b.math('SUBTRACT', 1.0, b.attr("TF Remove Trees", -1500, 900), -1300, 900)
     rem_grass = b.math('SUBTRACT', 1.0, b.attr("TF Remove Grass", -1500, 1050), -1300, 1050)
     grass_on = b.compare('GREATER_THAN', I["Grass per Hectare"], 0.0, -1300, 1200)
@@ -303,12 +315,59 @@ def build_node_group():
         b.put(sep.inputs["Selection"], far)
         plant(sep.outputs["Inverted"], coll, x + 3400, y + 200)
         plant(sep.outputs["Selection"], cards, x + 3400, y - 500)
+    # Bare earth: the painted part of the terrain, divided finely, trimmed to a ragged edge, lifted a
+    # little and given the dirt material.
+    x, y = -1100, -3200
+    touched = b.node('GeometryNodeFieldOnDomain', x, y, domain='FACE', data_type='FLOAT')
+    b.put(touched.inputs[0], dirt)
+    has = b.compare('GREATER_THAN', touched.outputs[0], 0.001, x + 200, y)
+    part = b.node('GeometryNodeSeparateGeometry', x + 400, y, domain='FACE')
+    b.put(part.inputs["Geometry"], ground)
+    b.put(part.inputs["Selection"], has)
+    # Split each cell along the same diagonal the terrain is drawn with, so the finer dirt lies in
+    # exactly the terrain's planes and the ground never pokes through it.
+    tri = b.node('GeometryNodeTriangulate', x + 500, y + 200)
+    tri.inputs["Quad Method"].default_value = 'Fixed'
+    b.put(tri.inputs["Mesh"], part.outputs["Selection"])
+    sub = b.node('GeometryNodeSubdivideMesh', x + 600, y)
+    b.put(sub.inputs["Mesh"], tri.outputs[0])
+    b.put(sub.inputs["Level"], I["Bare Earth Detail"])
+    npos = b.node('GeometryNodeInputPosition', x + 600, y - 300)
+    noise = b.node('ShaderNodeTexNoise', x + 800, y - 300)
+    b.put(noise.inputs["Vector"], npos.outputs[0])
+    noise.inputs["Scale"].default_value = 0.12
+    noise.inputs["Detail"].default_value = 4.0
+    wob = b.math('MULTIPLY', b.math('SUBTRACT', noise.outputs["Fac"], 0.5, x + 1000, y - 300), 0.6, x + 1200, y - 300)
+    edge = b.math('ADD', dirt, wob, x + 1400, y - 200)
+    on_face = b.node('GeometryNodeFieldOnDomain', x + 1600, y - 200, domain='FACE', data_type='FLOAT')
+    b.put(on_face.inputs[0], edge)
+    keep = b.compare('GREATER_THAN', on_face.outputs[0], 0.5, x + 1800, y - 200)
+    trim = b.node('GeometryNodeSeparateGeometry', x + 1800, y, domain='FACE')
+    b.put(trim.inputs["Geometry"], sub.outputs[0])
+    b.put(trim.inputs["Selection"], keep)
+    lift = b.node('GeometryNodeSetPosition', x + 2000, y)
+    b.put(lift.inputs["Geometry"], trim.outputs["Selection"])
+    b.put(lift.inputs["Offset"], (0.0, 0.0, DIRT_LIFT))
+    smooth = b.node('GeometryNodeSetShadeSmooth', x + 2200, y)
+    b.put(smooth.inputs["Geometry"], lift.outputs[0])
+    # Shade like the terrain underneath: its smooth normals, not the facets of the finer dirt.
+    gnorm = b.node('GeometryNodeInputNormal', x + 2200, y - 400)
+    near = b.node('GeometryNodeSampleNearestSurface', x + 2400, y - 300, data_type='FLOAT_VECTOR')
+    b.put(near.inputs["Mesh"], ground)
+    b.put(near.inputs["Value"], gnorm.outputs["Normal"])
+    snorm = b.node('GeometryNodeSetMeshNormal', x + 2600, y, mode='FREE', domain='POINT')
+    b.put(snorm.inputs["Mesh"], smooth.outputs[0])
+    b.put(snorm.inputs["Custom Normal"], near.outputs["Value"])
+    mat = b.node('GeometryNodeSetMaterial', x + 2800, y)
+    b.put(mat.inputs["Geometry"], snorm.outputs[0])
+    b.put(mat.inputs["Material"], I["Bare Earth Material"])
+    ng.links.new(mat.outputs[0], join.inputs[0])
     ng.links.new(join.outputs[0], gout.inputs[0])
     return ng
 
 
 def clearing_collection():
-    """Collection of everything plants keep away from: CivilFlow roads and lakes, kept up to date."""
+    """Collection of everything plants keep away from: CivilFlow roads, lakes and lines, kept up to date."""
     col = bpy.data.collections.get(CLEARING)
     if col is None:
         col = bpy.data.collections.new(CLEARING)
@@ -323,7 +382,8 @@ def sync_clearing(scene):
         props = getattr(ob, "civil_props", None)
         road = props is not None and props.is_civil_object
         lake = bool(ob.get("cf_water_of"))  # CivilFlow lakes and ponds
-        if ob.type == 'MESH' and (road or lake) and ob.name not in col.objects:
+        line = bool(ob.get("cf_utility"))   # CivilFlow power lines and path lights
+        if ob.type == 'MESH' and (road or lake or line) and ob.name not in col.objects:
             col.objects.link(ob)
 
 
@@ -377,10 +437,61 @@ def sync_modifier(forest, scene=None):
         "Card Distance": p.card_distance,
         "Viewport Cards": p.viewport_cards,
         "Grass Distance": p.grass_distance,
+        "Bare Earth Material": dirt_material(tuple(p.dirt_color)),
+        "Bare Earth Detail": _dirt_detail(p.terrain),
     }
     for name, value in values.items():
         set_input(mod, socket_id(ng, name), value)
     forest.update_tag()
+
+
+def _dirt_detail(terrain):
+    """Subdivisions that make dirt cells about half a metre across."""
+    try:
+        cell = max(abs(terrain["cf_grid"][2]), abs(terrain["cf_grid"][3]))
+    except (KeyError, TypeError):
+        return 2
+    return max(0, min(4, int(math.ceil(math.log2(max(cell, 0.5) / 0.5)))))
+
+
+def dirt_material(color=(0.33, 0.085, 0.032)):
+    """Fresh dirt in the given colour (Georgia red clay by default), mottled, with clods and ruts."""
+    mat = bpy.data.materials.get(DIRT_MATERIAL)
+    c = tuple(color)
+    if mat is None:
+        mat = bpy.data.materials.new(DIRT_MATERIAL)
+        nt = mat.node_tree
+        bsdf = next((n for n in nt.nodes if n.type == 'BSDF_PRINCIPLED'), None) if nt else None
+        if nt is not None and bsdf is None:
+            bsdf = nt.nodes.new('ShaderNodeBsdfPrincipled')
+            out = next((n for n in nt.nodes if n.type == 'OUTPUT_MATERIAL'), None) or nt.nodes.new('ShaderNodeOutputMaterial')
+            nt.links.new(bsdf.outputs["BSDF"], out.inputs["Surface"])
+        if bsdf is not None:
+            bsdf.inputs["Roughness"].default_value = 0.95
+            coord = nt.nodes.new('ShaderNodeTexCoord')
+            noise = nt.nodes.new('ShaderNodeTexNoise')
+            noise.inputs["Scale"].default_value = 0.6
+            noise.inputs["Detail"].default_value = 8.0
+            noise.inputs["Roughness"].default_value = 0.6
+            mix = nt.nodes.new('ShaderNodeMix')
+            mix.data_type = 'RGBA'
+            mix.name = "TF Dirt Colors"
+            bump = nt.nodes.new('ShaderNodeBump')
+            bump.inputs["Strength"].default_value = 0.35
+            nt.links.new(coord.outputs["Object"], noise.inputs["Vector"])
+            nt.links.new(noise.outputs["Fac"], mix.inputs["Factor"])
+            nt.links.new(mix.outputs["Result"], bsdf.inputs["Base Color"])
+            nt.links.new(noise.outputs["Fac"], bump.inputs["Height"])
+            nt.links.new(bump.outputs["Normal"], bsdf.inputs["Normal"])
+            for k, n in enumerate((coord, noise, mix, bump)):
+                n.location = (bsdf.location.x - 900 + 220 * k, bsdf.location.y - 200)
+    if tuple(round(v, 4) for v in mat.diffuse_color[:3]) != tuple(round(v, 4) for v in c):
+        mat.diffuse_color = c + (1.0,)
+        mix = mat.node_tree.nodes.get("TF Dirt Colors") if mat.node_tree else None
+        if mix is not None:
+            mix.inputs["A"].default_value = tuple(v * 0.7 for v in c) + (1.0,)
+            mix.inputs["B"].default_value = tuple(min(1.0, v * 1.3) for v in c) + (1.0,)
+    return mat
 
 
 def _input_slot(mod, key):

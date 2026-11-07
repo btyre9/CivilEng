@@ -1,7 +1,7 @@
 bl_info = {
     "name": "CivilFlow: Road, Highway & Overpass Generator",
     "author": "AI Assistant",
-    "version": (1, 11, 0),
+    "version": (1, 13, 0),
     "blender": (5, 1, 0),
     "location": "View3D > Sidebar (N) > CivilEng",
     "description": "Procedural roads built from straights and curves, highways, banking, guardrails, gantry signs, tunnels, embankments, cable-stayed towers, toll plazas, animated low-poly traffic, and real USGS terrain with automatic bridges, tunnels and earthworks.",
@@ -18,6 +18,9 @@ import numpy as np
 from . import traffic
 from . import terrain
 from . import water
+from . import utilities
+from . import junctions
+from . import sim
 
 # ==============================================================================
 # 1. PROCEDURAL MATERIALS HELPER (BLENDER 5.x API)
@@ -69,6 +72,16 @@ def ensure_civil_materials(obj):
         get_or_create_material("Civil_LED_Amber", (1.0, 0.55, 0.05, 1.0), roughness=0.3,
                                emission_color=(1.0, 0.5, 0.02, 1.0), emission_strength=12.0),  # Slot 10: LED message text
         get_or_create_material("Civil_Sign_Cabinet", (0.025, 0.025, 0.028, 1.0), roughness=0.5),  # Slot 11: LED sign cabinet
+        get_or_create_material("Civil_CastIron", (0.018, 0.018, 0.02, 1.0), roughness=0.4, metallic=0.6),  # Slot 12: painted cast iron
+        get_or_create_material("Civil_Globe_Warm", (0.95, 0.88, 0.75, 1.0), roughness=0.3,
+                               emission_color=(1.0, 0.8, 0.52, 1.0), emission_strength=10.0),  # Slot 13: warm glass globe
+        get_or_create_material("Civil_Wood_Pole", (0.13, 0.085, 0.055, 1.0), roughness=0.9),     # Slot 14: creosoted wood
+        get_or_create_material("Civil_Porcelain", (0.28, 0.11, 0.05, 1.0), roughness=0.2),        # Slot 15: glazed porcelain
+        get_or_create_material("Civil_Wire", (0.03, 0.03, 0.03, 1.0), roughness=0.4, metallic=0.8),  # Slot 16: power wire
+        get_or_create_material("Civil_Transformer", (0.42, 0.45, 0.46, 1.0), roughness=0.5, metallic=0.3),  # Slot 17
+        get_or_create_material("Civil_Polymer", (0.55, 0.57, 0.58, 1.0), roughness=0.6),          # Slot 18: polymer insulators
+        get_or_create_material("Civil_Grass", (0.09, 0.18, 0.05, 1.0), roughness=0.9),            # Slot 19: island grass
+        get_or_create_material("Civil_Sign_Red", (0.5, 0.01, 0.01, 1.0), roughness=0.4),          # Slot 20: stop / yield signs
     ]
     obj.data.materials.clear()
     for m in mats:
@@ -847,9 +860,13 @@ def add_gantry(bm, sample, style, carriageways, left_x, right_x, clearance, sign
         place_sign(*sign)
 
 
-def add_streetlight_at(bm, base_p, right, tangent, normal, arm_dir, pole_h, arm_len):
-    """Steel pole on a concrete plinth with a mast arm and an emissive luminaire head.
-    Pass an upright frame (see flat_frame) so the pole stands vertical on banked roads."""
+def add_streetlight_at(bm, base_p, right, tangent, normal, arm_dir, pole_h, arm_len, style='COBRA'):
+    """Streetlight in the given style (see utilities.LIGHT_STYLES); the cobra head is a steel pole on a
+    concrete plinth with a mast arm and an emissive luminaire head. Pass an upright frame (see
+    flat_frame) so the pole stands vertical on banked roads."""
+    if style != 'COBRA':
+        utilities.add_light(bm, base_p, right * arm_dir, tangent, style, pole_h, arm_len)
+        return
     add_box_prism(bm, base_p - normal * 0.35, right, tangent, normal, 0.22, 0.22, 0.7, mat_index=1)
     add_cylinder(bm, base_p, right, tangent, normal, radius=0.11, height=pole_h, num_segments=8, mat_index=6)
 
@@ -1535,6 +1552,9 @@ def rebuild_civil_mesh(obj, depsgraph=None, carve=True):
             ):
                 if n_lanes <= 0:
                     continue
+                if props.gantry_style == 'CANTILEVER' and props.gantry_side != 'BOTH' \
+                        and side != (1.0 if props.gantry_side == 'RIGHT' else -1.0):
+                    continue  # one arm, on the side you picked
                 span = n_lanes * props.lane_width
                 if props.gantry_style == 'CANTILEVER':
                     # One sign over the outer lanes, on a short arm from the roadside post.
@@ -1580,19 +1600,31 @@ def rebuild_civil_mesh(obj, depsgraph=None, carve=True):
                     for side, g_ext in ((-1.0, left_gore_ext[i]), (1.0, right_gore_ext[i])):
                         base_p = p_curr + right * (side * (pole_offset + g_ext)) + norm * asphalt_h
                         add_streetlight_at(bm, base_p, r_up, t_up, up, arm_dir=-side,
-                                           pole_h=props.streetlight_height, arm_len=props.streetlight_arm_length)
+                                           pole_h=props.streetlight_height, arm_len=props.streetlight_arm_length,
+                                           style=props.streetlight_style)
+                elif props.streetlight_placement in ('LEFT', 'RIGHT'):
+                    side = -1.0 if props.streetlight_placement == 'LEFT' else 1.0
+                    g_ext = left_gore_ext[i] if side < 0 else right_gore_ext[i]
+                    base_p = p_curr + right * (side * (pole_offset + g_ext)) + norm * asphalt_h
+                    add_streetlight_at(bm, base_p, r_up, t_up, up, arm_dir=-side,
+                                       pole_h=props.streetlight_height, arm_len=props.streetlight_arm_length,
+                                       style=props.streetlight_style)
                 elif props.streetlight_placement == 'ALTERNATING':
                     side = -1.0 if (pole_idx % 2 == 0) else 1.0
                     g_ext = left_gore_ext[i] if side < 0 else right_gore_ext[i]
                     base_p = p_curr + right * (side * (pole_offset + g_ext)) + norm * asphalt_h
                     add_streetlight_at(bm, base_p, r_up, t_up, up, arm_dir=-side,
-                                       pole_h=props.streetlight_height, arm_len=props.streetlight_arm_length)
+                                       pole_h=props.streetlight_height, arm_len=props.streetlight_arm_length,
+                                       style=props.streetlight_style)
                 elif props.streetlight_placement == 'MEDIAN':
                     base_p = p_curr + right * med_center_x + norm * asphalt_h
                     add_streetlight_at(bm, base_p, r_up, t_up, up, arm_dir=-1.0,
-                                       pole_h=props.streetlight_height, arm_len=props.streetlight_arm_length)
-                    add_streetlight_at(bm, base_p, r_up, t_up, up, arm_dir=1.0,
-                                       pole_h=props.streetlight_height, arm_len=props.streetlight_arm_length)
+                                       pole_h=props.streetlight_height, arm_len=props.streetlight_arm_length,
+                                       style=props.streetlight_style)
+                    if props.streetlight_style in ('COBRA', 'MODERN'):  # twin arms; post-top lights stand alone
+                        add_streetlight_at(bm, base_p, r_up, t_up, up, arm_dir=1.0,
+                                           pole_h=props.streetlight_height, arm_len=props.streetlight_arm_length,
+                                           style=props.streetlight_style)
                 pole_idx += 1
 
     # 14. Overpass Support Pillars
@@ -1670,6 +1702,9 @@ def rebuild_civil_mesh(obj, depsgraph=None, carve=True):
         for d in pier_ds:
             place_pier(d, cum)
 
+    # Intersections: the road gives way to their pads.
+    junctions.trim_road(bm, obj)
+
     # Dashed extrusions leave unused ring vertices behind; drop them.
     loose = [v for v in bm.verts if not v.link_faces]
     if loose:
@@ -1699,10 +1734,21 @@ def rebuild_civil_mesh(obj, depsgraph=None, carve=True):
     if carve and old_terrain and (terrain_obj is None or old_terrain != terrain_obj.name):
         terrain.carve(bpy.data.objects.get(old_terrain), rebuild_fn=_rebuild_without_carving)
 
+    # Intersections on this road follow it.
+    junctions.road_rebuilt(obj, depsgraph)
+
 
 # ==============================================================================
 # 5. PROPERTY GROUP DEFINITION
 # ==============================================================================
+
+def _streetlight_style_changed(self, context):
+    """A new light style starts from its own usual height and spacing."""
+    h, spacing = utilities.LIGHT_DEFAULTS[self.streetlight_style]
+    self["streetlight_height"] = h
+    self["streetlight_spacing"] = spacing
+    update_civil_prop(self, context)
+
 
 def update_civil_prop(self, context):
     obj = self.id_data
@@ -2140,6 +2186,16 @@ class CIVIL_PG_ObjectProps(bpy.types.PropertyGroup):
         default='FULL_SPAN',
         update=update_civil_prop
     )
+    gantry_side: bpy.props.EnumProperty(
+        name="Side",
+        items=[
+            ('BOTH', "Both Sides", "An arm from each side of the road, each over its own lanes"),
+            ('RIGHT', "Right Side Only", "One post on the right edge with an arm and sign over the right lanes"),
+            ('LEFT', "Left Side Only", "One post on the left edge with an arm and sign over the left lanes"),
+        ],
+        default='BOTH',
+        update=update_civil_prop
+    )
     gantry_sign_type: bpy.props.EnumProperty(
         name="Signs",
         items=[
@@ -2178,11 +2234,18 @@ class CIVIL_PG_ObjectProps(bpy.types.PropertyGroup):
         name="Placement",
         items=[
             ('BOTH', "Both Sides", "Dual streetlights on left and right edges"),
+            ('LEFT', "Left Side Only", "Streetlights along the left edge only"),
+            ('RIGHT', "Right Side Only", "Streetlights along the right edge only"),
             ('ALTERNATING', "Alternating Staggered", "Staggered left/right streetlights"),
             ('MEDIAN', "Central Median Double-Mast", "Center twin-arm mast poles along the median"),
         ],
         default='BOTH',
         update=update_civil_prop
+    )
+    streetlight_style: bpy.props.EnumProperty(
+        name="Light Style", items=utilities.LIGHT_STYLES, default='COBRA',
+        update=lambda self, context: _streetlight_style_changed(self, context),
+        description="Highway cobra heads, classical park and downtown lights, or modern LED blades"
     )
     streetlight_spacing: bpy.props.FloatProperty(
         name="Light Spacing", default=28.0, min=8.0, max=80.0, unit='LENGTH', update=update_civil_prop
@@ -2301,6 +2364,11 @@ class CIVIL_PG_ObjectProps(bpy.types.PropertyGroup):
     traffic_left_hand: bpy.props.BoolProperty(
         name="Drive on Left", default=False,
         description="Left-hand traffic (UK, Japan, Australia...). Otherwise traffic keeps right"
+    )
+    traffic_duration: bpy.props.FloatProperty(
+        name="Simulate (seconds)", default=60.0, min=5.0, max=1800.0,
+        description="Where roads meet at intersections, traffic is worked out ahead of time for this long "
+                    "(the scene's frame range grows to fit) and stored as keyframes"
     )
     traffic_collection: bpy.props.PointerProperty(type=bpy.types.Collection)
 
@@ -3196,6 +3264,8 @@ class CIVIL_PT_MainPanel(bpy.types.Panel):
             g_box.prop(props, "add_gantry_signs")
             if props.add_gantry_signs:
                 g_box.prop(props, "gantry_style")
+                if props.gantry_style == 'CANTILEVER':
+                    g_box.prop(props, "gantry_side")
                 g_box.prop(props, "gantry_sign_type")
                 if props.gantry_sign_type in ('GUIDE', 'ALTERNATE'):
                     g_box.prop(props, "guide_sign_text", text="Guide")
@@ -3209,6 +3279,7 @@ class CIVIL_PT_MainPanel(bpy.types.Panel):
             g_box.separator()
             g_box.prop(props, "add_streetlights")
             if props.add_streetlights:
+                g_box.prop(props, "streetlight_style")
                 g_box.prop(props, "streetlight_placement")
                 g_box.prop(props, "streetlight_spacing")
                 row = g_box.row(align=True)
@@ -3225,6 +3296,10 @@ class CIVIL_PT_MainPanel(bpy.types.Panel):
             row = tr_box.row(align=True)
             row.prop(props, "traffic_seed")
             row.prop(props, "traffic_left_hand", toggle=True)
+            on_junction = any(junctions.is_junction(o) and obj in (o.civil_junction.road_a, o.civil_junction.road_b)
+                              for o in context.scene.objects)
+            if on_junction:
+                tr_box.prop(props, "traffic_duration")
             row = tr_box.row(align=True)
             has_traffic = props.traffic_collection is not None
             row.operator("civil.traffic_generate", icon='PLAY',
@@ -3235,6 +3310,9 @@ class CIVIL_PT_MainPanel(bpy.types.Panel):
                 n_roads = len(traffic.roads_sharing_traffic(props.traffic_collection))
                 linked = f" on {n_roads} linked roads" if n_roads > 1 else ""
                 tr_box.label(text=f"{n} vehicles{linked}. Press Space to play.", icon='INFO')
+                if props.traffic_collection.get("cf_simulated"):
+                    tr_box.label(text="Stops, signals and turns are worked out ahead:", icon='TIME')
+                    tr_box.label(text="regenerate after changing roads or intersections")
             else:
                 tr_box.label(text="Roads whose ends meet share their traffic", icon='LINKED')
 
@@ -3310,10 +3388,12 @@ classes = (
 )
 
 def register():
-    for cls in classes + traffic.classes + terrain.classes + water.classes:
+    for cls in classes + traffic.classes + terrain.classes + water.classes + utilities.classes + junctions.classes:
         bpy.utils.register_class(cls)
     bpy.types.Object.civil_props = bpy.props.PointerProperty(type=CIVIL_PG_ObjectProps)
     bpy.types.Scene.civil_terrain = bpy.props.PointerProperty(type=terrain.CIVIL_PG_TerrainSettings)
+    utilities.register_extra()
+    junctions.register_extra()
     if civil_depsgraph_update_handler not in bpy.app.handlers.depsgraph_update_post:
         bpy.app.handlers.depsgraph_update_post.append(civil_depsgraph_update_handler)
 
@@ -3322,7 +3402,9 @@ def unregister():
         bpy.app.handlers.depsgraph_update_post.remove(civil_depsgraph_update_handler)
     del bpy.types.Scene.civil_terrain
     del bpy.types.Object.civil_props
-    for cls in reversed(classes + traffic.classes + terrain.classes + water.classes):
+    utilities.unregister_extra()
+    junctions.unregister_extra()
+    for cls in reversed(classes + traffic.classes + terrain.classes + water.classes + utilities.classes + junctions.classes):
         bpy.utils.unregister_class(cls)
 
 if __name__ == "__main__":

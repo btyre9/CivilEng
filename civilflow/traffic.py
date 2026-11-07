@@ -571,6 +571,16 @@ def build_traffic(context, road):
     p = road.civil_props
     scene = context.scene
     dg = context.evaluated_depsgraph_get()
+    # Roads meeting at intersections: traffic that stops, waits and turns, worked out ahead of time.
+    from . import sim, junctions
+    js = [o for o in scene.objects if junctions.is_junction(o)]
+    for j in js:
+        if "cf_layout" not in j:
+            junctions.build(j, dg)  # made by an earlier version: work out its layout
+    if any(j.get("cf_layout") for j in js):
+        net = sim.Network(scene, road, p.traffic_left_hand, dg)
+        if net.juncs:
+            return sim.build(context, road, net)
     lanes, succ, roads = find_network(scene, road, p.traffic_left_hand, dg)
     for r in roads:
         remove_traffic(r)

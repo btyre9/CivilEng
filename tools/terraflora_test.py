@@ -122,6 +122,21 @@ def main():
     added = count_in({"p": plants(forest).get("TF Pine", np.zeros((0, 3)))}, 155, 255, 105, 175)
     report("PAINT", before > 30 and after == 0 and added > 10,
            f"plants in painted-out square {before} -> {after}; pines painted onto grass {added}")
+    # Bare earth: dirt surface where painted, nothing growing on it.
+    before_d = count_in(plants(forest), -280, -220, 100, 160)
+    paint("TF Bare Earth", -280, -220, 100, 160)
+    dg = bpy.context.evaluated_depsgraph_get()
+    fme = forest.evaluated_get(dg).data
+    dco = np.array([tuple(v.co) for v in fme.vertices]) if len(fme.vertices) else np.zeros((0, 3))
+    after_d = count_in(plants(forest), -270, -230, 110, 150)
+    mats = [m.name for m in fme.materials if m]
+    inside = ((dco[:, 0] > -295) & (dco[:, 0] < -205) & (dco[:, 1] > 85) & (dco[:, 1] < 175)).all() if len(dco) else False
+    area = sum(pg.area for pg in fme.polygons)
+    gz = T.ground_for(ter).world_heights(dco[:, 0], dco[:, 1]) if len(dco) else np.zeros(1)
+    lift = float(np.median(dco[:, 2] - gz)) if len(dco) else 0.0
+    report("BARE EARTH", before_d > 10 and after_d == 0 and inside and 2500 < area < 5200
+           and F.DIRT_MATERIAL in mats and 0.03 < lift < 0.1,
+           f"plants {before_d} -> {after_d}; dirt {area:.0f} m² (painted 3600), material {mats}, {lift:.2f} m above ground")
     bpy.ops.terraflora.clear_paint()
     restored = count_in(plants(forest), -195, -105, -45, 45)
     report("PAINT RESET", restored > 30 and not any(n.startswith("TF Add") or n == "TF Remove Trees"
