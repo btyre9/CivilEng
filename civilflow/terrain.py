@@ -277,16 +277,22 @@ def drape(road, samples, ground, pin_start_z=None):
     z = z + p.terrain_offset
 
     w = np.ones(n)
-    # Overpasses you placed lift the road until there's the clearance you asked for underneath.
+    # Overpasses you placed get a straight deck: the lowest straight line, within the grade limit,
+    # that leaves the clearance you asked for everywhere underneath. Following the ground point by
+    # point would copy every dip of the land into the deck.
     deck = p.deck_thickness + 0.1
+    max_slope = p.max_grade / 100.0
+    decks = []  # (selection, straight deck heights)
     for st in p.structures:
         if st.kind != 'BRIDGE':
             continue
         sel = np.abs(d - st.center) <= st.length * 0.5
-        need = g + st.clearance + deck
-        lift = sel & (need >= z - 0.01)
-        z = np.where(lift, need, z)
-        w = np.where(lift, 1000.0, w)
+        if sel.sum() < 2:
+            continue
+        line = straight_deck(d, g + st.clearance + deck, sel, max_slope)
+        z = np.where(sel, line, z)
+        w = np.where(sel, 1000.0, w)
+        decks.append((sel, line))
     # Over lakes the road climbs to bridge height, unless you asked for an earth bank (a causeway).
     wl = ground.water_levels(xs, ys)
     wet = ~np.isnan(wl)
@@ -310,6 +316,36 @@ def drape(road, samples, ground, pin_start_z=None):
     # Round off the kinks between slopes (vertical curves); averaging keeps the grade limit.
     k = int(round(min(60.0, max(10.0, p.terrain_smoothing * 0.4)) / (2.0 * step)))
     z = _box(z, k, keep_slope=True)
+    # Smoothing rounds the decks too: put each back on its straight line, and bend the approaches
+    # onto it with vertical curves. Beside a deck the road is held between two curves that leave
+    # the deck at its own slope and steepen to the grade limit (one bending down, one up), so the
+    # joint has no corner and the grade limit still holds.
+    vc_len = max(20.0, min(80.0, p.terrain_smoothing))
+    on_deck = np.zeros(n, dtype=bool)
+    for sel, _line in decks:
+        on_deck |= sel
+    for sel, line in decks:
+        idx = np.nonzero(sel)[0]
+        a, b = idx[0], idx[-1]
+        slope = (line[b] - line[a]) / max(1e-6, d[b] - d[a])
+        for end, away in ((a, -1), (b, 1)):
+            j = end + away
+            while 0 <= j < n and not on_deck[j]:
+                j += away
+            span = np.arange(end + away, j, away)  # the open road on this side, up to the next deck
+            if not len(span):
+                continue
+            u = np.abs(d[span] - d[end])
+            uu = np.minimum(u, vc_len)
+            s0 = slope * away  # the deck's slope, heading away from it
+
+            def bend(target):
+                # Slope eases from s0 to target over vc_len, then holds at target.
+                return line[end] + s0 * uu + (target - s0) * uu * uu / (2.0 * vc_len) + target * (u - uu)
+
+            z[span] = np.clip(z[span], bend(-max_slope), bend(max_slope))
+    for sel, line in decks:
+        z[sel] = line[sel]
     # Smoothing can nudge the ends a little; ease them back onto their pins.
     L = max(30.0, min(p.terrain_smoothing, d[-1] * 0.25))
     if start_z is not None:
@@ -337,6 +373,27 @@ def drape(road, samples, ground, pin_start_z=None):
         normal = right.cross(t).normalized()
         out.append((Mi @ P[i], (Ri @ t).normalized(), (Ri @ normal).normalized(), (Ri @ right).normalized()))
     return out
+
+
+def straight_deck(d, need, sel, max_slope):
+    """
+    Heights along d of the lowest straight line (by its average height over the selected stretch)
+    that stays at or above `need` at every selected sample, with a slope no steeper than max_slope.
+    """
+    x = d[sel]
+    y = need[sel]
+    # The best line touches the upper hull of the points, so its slope is one of the pairwise
+    # slopes or the grade limit; try them all.
+    i, j = np.triu_indices(len(x), 1)
+    dx = x[j] - x[i]
+    ok = dx > 1e-9
+    slopes = np.concatenate([(y[j][ok] - y[i][ok]) / dx[ok], [-max_slope, 0.0, max_slope]])
+    slopes = np.unique(np.clip(slopes, -max_slope, max_slope))
+    xm = x.mean()
+    # For each slope, the line resting on the highest point; keep the one lowest on average.
+    offsets = np.max(y[None, :] - slopes[:, None] * (x[None, :] - xm), axis=1)
+    best = int(np.argmin(offsets))
+    return offsets[best] + slopes[best] * (d - xm)
 
 
 def fit_grade(target, max_rise, weights=None):

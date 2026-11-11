@@ -252,6 +252,27 @@ def terrain_tests(mod, failures):
     while len(p.structures):
         bpy.ops.civil.structure_remove()
 
+    # An overpass over uneven ground keeps a straight deck (no dips copying the land below)
+    # and still has the clearance asked for everywhere along it.
+    bpy.context.scene.cursor.location = (-290.0, 0.0, 0.0)
+    bpy.ops.civil.structure_add(kind='BRIDGE')
+    st = p.structures[0]
+    st.length = 80.0
+    smp_s = mod.road_local_samples(road)
+    xs_s = np.array([sp[0].x for sp in smp_s])
+    zs_s = np.array([sp[0].z for sp in smp_s])
+    on = np.abs(xs_s + 290.0) <= 38.0
+    fit = np.polyval(np.polyfit(xs_s[on], zs_s[on], 1), xs_s[on])
+    wobble = float(np.max(np.abs(zs_s[on] - fit)))
+    g_s = g.world_heights(xs_s[on], np.zeros(int(on.sum())))
+    low_clear = float(np.min(zs_s[on] - p.deck_thickness - g_s))
+    grade_s = float(np.max(np.abs(np.diff(zs_s)) / np.abs(np.diff(xs_s)))) * 100.0
+    report("TERRAIN STRAIGHT", wobble < 0.05 and low_clear >= st.clearance - 0.1 and grade_s <= p.max_grade + 0.05,
+           f"overpass deck off a straight line by {wobble:.3f} m; lowest clearance {low_clear:.2f} m "
+           f"(asked {st.clearance:g}); steepest grade on the road {grade_s:.2f}% (limit {p.max_grade:g})")
+    while len(p.structures):
+        bpy.ops.civil.structure_remove()
+
     # A road continued from it starts exactly on its end and keeps following the land.
     bpy.ops.civil.road_continue(preset_type='HIGHWAY', length=150.0, bend=-20.0)
     road2 = bpy.context.active_object

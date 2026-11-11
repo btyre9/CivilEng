@@ -1,7 +1,7 @@
 bl_info = {
     "name": "CivilFlow: Road, Highway & Overpass Generator",
     "author": "AI Assistant",
-    "version": (1, 13, 0),
+    "version": (1, 13, 1),
     "blender": (5, 1, 0),
     "location": "View3D > Sidebar (N) > CivilEng",
     "description": "Procedural roads built from straights and curves, highways, banking, guardrails, gantry signs, tunnels, embankments, cable-stayed towers, toll plazas, animated low-poly traffic, and real USGS terrain with automatic bridges, tunnels and earthworks.",
